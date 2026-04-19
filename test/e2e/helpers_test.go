@@ -66,11 +66,39 @@ func testBindings() []rabbitmq.QueueBinding {
 	return bindings
 }
 
-// testTopology returns the full 9-queue test topology.
+// testTopology returns the full 9-queue test topology (no retry/DLQ queues).
+// Phase 1/2/3 tests use this.
 func testTopology() rabbitmq.Topology {
 	return rabbitmq.Topology{
-		Exchange: testExchange,
-		Bindings: testBindings(),
+		Exchange:  testExchange,
+		Bindings:  testBindings(),
+		Prefix:    "test_",
+		RetryTTLs: rabbitmq.ProductionRetryTTLs(),
+	}
+}
+
+// phase4ExchangeName is the test exchange for Phase 4 tests. Using a separate
+// exchange (and "p4_" prefixed queues) avoids declaration conflicts with the
+// Phase 1-3 test topology which uses different TTLs.
+const phase4ExchangeName = "test_p4_notifications.topic"
+
+// phase4TestBindings returns test bindings with "test_p4_" prefix.
+func phase4TestBindings() []rabbitmq.QueueBinding {
+	bindings := rabbitmq.AllProductionBindings()
+	for i := range bindings {
+		bindings[i].Queue = "test_p4_" + bindings[i].Queue
+	}
+	return bindings
+}
+
+// phase4TestTopology returns a topology with short TTLs suitable for fast e2e
+// retry tests. Uses "test_p4_" prefix to avoid conflict with the base topology.
+func phase4TestTopology(ttls rabbitmq.RetryTTLs) rabbitmq.Topology {
+	return rabbitmq.Topology{
+		Exchange:  phase4ExchangeName,
+		Bindings:  phase4TestBindings(),
+		Prefix:    "test_p4_",
+		RetryTTLs: ttls,
 	}
 }
 
@@ -121,19 +149,60 @@ func newHarness(t *testing.T) *harness {
 	return &harness{pool: pool, rmqConn: rmqConn, topo: topo}
 }
 
+// newHarnessWithTTLs creates a harness that also declares retry/DLQ topology
+// with the given TTLs. Used by Phase 4 tests.
+func newHarnessWithTTLs(t *testing.T, ttls rabbitmq.RetryTTLs) *harness {
+	t.Helper()
+	ctx := context.Background()
+
+	ensureTestDB(t)
+
+	pool, err := platform.NewPgxPool(ctx, testDSN)
+	if err != nil {
+		t.Fatalf("connect test postgres: %v", err)
+	}
+
+	runMigrations(t, testDSN)
+
+	rmqConn, err := rabbitmq.Dial(rmqURL)
+	if err != nil {
+		pool.Close()
+		t.Fatalf("connect rabbitmq: %v", err)
+	}
+
+	topo := phase4TestTopology(ttls)
+
+	topoCh, err := rmqConn.Channel()
+	if err != nil {
+		_ = rmqConn.Close()
+		pool.Close()
+		t.Fatalf("open topology channel: %v", err)
+	}
+	if err := rabbitmq.DeclareTopologyWith(topoCh, topo); err != nil {
+		_ = topoCh.Close()
+		_ = rmqConn.Close()
+		pool.Close()
+		t.Fatalf("declare phase4 test topology: %v", err)
+	}
+	_ = topoCh.Close()
+
+	return &harness{pool: pool, rmqConn: rmqConn, topo: topo}
+}
+
 func (h *harness) close() {
 	_ = h.rmqConn.Close()
 	h.pool.Close()
 }
 
-// reset truncates the notifications and processed_messages tables and purges
-// all test queues so each subtest starts clean.
+// reset truncates the notifications, processed_messages, and delivery_attempts
+// tables and purges all test queues so each subtest starts clean.
+// CASCADE ensures any FK-referencing tables (delivery_attempts) are cleared too.
 func (h *harness) reset(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE notifications"); err != nil {
+	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE notifications CASCADE"); err != nil {
 		t.Fatalf("truncate notifications: %v", err)
 	}
 	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE processed_messages"); err != nil {
@@ -143,8 +212,8 @@ func (h *harness) reset(t *testing.T) {
 	h.purgeAllQueues(t)
 }
 
-// resetFull truncates batches (cascades to notifications) and processed_messages,
-// and purges all test queues.
+// resetFull truncates batches (cascades to notifications and delivery_attempts),
+// processed_messages, and purges all test queues.
 func (h *harness) resetFull(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -152,6 +221,9 @@ func (h *harness) resetFull(t *testing.T) {
 
 	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE batches CASCADE"); err != nil {
 		t.Fatalf("truncate batches: %v", err)
+	}
+	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE notifications CASCADE"); err != nil {
+		t.Fatalf("truncate notifications: %v", err)
 	}
 	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE processed_messages"); err != nil {
 		t.Fatalf("truncate processed_messages: %v", err)
@@ -168,9 +240,24 @@ func (h *harness) purgeAllQueues(t *testing.T) {
 	}
 	defer ch.Close()
 
+	// Purge main queues.
 	for _, b := range h.topo.Bindings {
 		if _, err := ch.QueuePurge(b.Queue, false); err != nil {
 			t.Logf("purge %s: %v (ok if queue doesn't exist yet)", b.Queue, err)
+		}
+	}
+
+	// Purge retry and DLQ queues (may not exist yet in non-phase4 tests — that's ok).
+	for _, channel := range []string{"email", "sms", "push"} {
+		for level := 1; level <= 3; level++ {
+			qName := h.topo.RetryQueueName(channel, level)
+			if _, err := ch.QueuePurge(qName, false); err != nil {
+				t.Logf("purge retry %s: %v (ok if queue doesn't exist)", qName, err)
+			}
+		}
+		dlqName := h.topo.DLQQueueName(channel)
+		if _, err := ch.QueuePurge(dlqName, false); err != nil {
+			t.Logf("purge dlq %s: %v (ok if queue doesn't exist)", dlqName, err)
 		}
 	}
 }
@@ -205,6 +292,12 @@ func (h *harness) startAPI(t *testing.T, webhookURL string, opts ...apiOption) *
 		Logger:      log,
 		Service:     svc,
 		RateLimiter: cfg.rateLimiter,
+		// Wire admin routes so Phase 4 tests can use /admin/dlq/*.
+		// Use topology prefix/exchange so admin routes target test-scoped queues.
+		AMQPChannelProvider: h.rmqConn,
+		AdminPublisher:      publisher,
+		AdminQueuePrefix:    h.topo.Prefix,
+		AdminMainExchange:   h.topo.Exchange,
 	})
 
 	srv := httptest.NewServer(router)
@@ -228,13 +321,59 @@ func withRateLimit(rps float64, burst int) apiOption {
 // startWorker registers consumers on all test queues and starts the delivery
 // loop in a background goroutine. Returns a cancel func; calling it stops the
 // worker and waits for it to drain.
+//
+// startWorker uses Phase 1/2/3 compatible behaviour: no retry publisher is
+// wired, so 500 webhooks immediately mark the notification failed. Phase 4
+// tests use startWorkerPhase4 instead.
 func (h *harness) startWorker(t *testing.T, webhookURL string) context.CancelFunc {
 	t.Helper()
 	return h.startWorkerWithDeliver(t, webhookURL, nil)
 }
 
+// startWorkerPhase4 builds a DeliverUseCase with retry publisher and attempt
+// recorder wired, then starts the worker. Use in Phase 4 subtests where you
+// need retry/DLQ routing and delivery_attempts recording.
+func (h *harness) startWorkerPhase4(t *testing.T, webhookURL string, providerOverride domain.Provider) context.CancelFunc {
+	t.Helper()
+
+	var prov domain.Provider
+	if providerOverride != nil {
+		prov = providerOverride
+	} else {
+		prov = provider.NewWebhookProvider(provider.WebhookOptions{
+			URL:     webhookURL,
+			Timeout: 5 * time.Second,
+		})
+	}
+
+	repo := pgadapter.NewNotificationRepository(h.pool)
+	processedRepo := pgadapter.NewProcessedRepository(h.pool)
+	attemptsRepo := pgadapter.NewDeliveryAttemptsRepository(h.pool)
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	retryPubCh, err := h.rmqConn.Channel()
+	if err != nil {
+		t.Fatalf("open retry publisher channel: %v", err)
+	}
+	t.Cleanup(func() { _ = retryPubCh.Close() })
+
+	retryPub, err := rabbitmq.NewPublisher(retryPubCh, h.topo.Exchange)
+	if err != nil {
+		t.Fatalf("create retry publisher: %v", err)
+	}
+	retryAdapter := rabbitmq.NewRetryPublisherAdapter(retryPub, h.topo)
+
+	deliver := app.NewDeliverUseCase(prov, repo, log).
+		WithProcessedMarker(processedRepo).
+		WithRetryPublisher(retryAdapter).
+		WithAttemptRecorder(attemptsRepo)
+
+	return h.startWorkerWithDeliver(t, webhookURL, deliver)
+}
+
 // startWorkerWithDeliver is like startWorker but accepts a pre-built
-// DeliverUseCase. Pass nil to build one from webhookURL (normal case).
+// DeliverUseCase. Pass nil to build one from webhookURL WITHOUT retry
+// publisher (Phase 1/2/3 compat).
 func (h *harness) startWorkerWithDeliver(t *testing.T, webhookURL string, deliver *app.DeliverUseCase) context.CancelFunc {
 	t.Helper()
 
@@ -251,15 +390,14 @@ func (h *harness) startWorkerWithDeliver(t *testing.T, webhookURL string, delive
 		repo := pgadapter.NewNotificationRepository(h.pool)
 		processedRepo := pgadapter.NewProcessedRepository(h.pool)
 		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+		// No retry publisher for Phase 1/2/3 compat: 500 → immediate failed.
 		deliver = app.NewDeliverUseCase(reg, repo, log).
 			WithProcessedMarker(processedRepo)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// We build one deliveries channel per queue binding and fan them into a
-	// single process loop. This mirrors production's one-goroutine-per-queue
-	// model without the overhead of per-channel AMQP channels.
 	type queueDeliveries struct {
 		queue      string
 		deliveries <-chan amqp.Delivery
@@ -342,7 +480,18 @@ func processDelivery(ctx context.Context, d amqp.Delivery, deliver *app.DeliverU
 			corrID = v
 		}
 	}
-	if err := deliver.Handle(ctx, d.Body, corrID); err != nil {
+	attempt := int32(0)
+	if d.Headers != nil {
+		switch v := d.Headers["x-attempt"].(type) {
+		case int32:
+			attempt = v
+		case int64:
+			attempt = int32(v)
+		case int:
+			attempt = int32(v)
+		}
+	}
+	if err := deliver.Handle(ctx, d.Body, corrID, int(attempt), d.RoutingKey); err != nil {
 		_ = d.Nack(false, false)
 		return
 	}
@@ -372,9 +521,40 @@ func (h *harness) pollStatus(t *testing.T, id string, deadline time.Duration) st
 	}
 }
 
+// pollStatusAny polls until the status is one of the given values.
+func (h *harness) pollStatusAny(t *testing.T, id string, deadline time.Duration, statuses ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	statusSet := make(map[string]bool, len(statuses))
+	for _, s := range statuses {
+		statusSet[s] = true
+	}
+
+	for {
+		var status string
+		err := h.pool.QueryRow(ctx,
+			"SELECT status FROM notifications WHERE id = $1", id,
+		).Scan(&status)
+		if err == nil && statusSet[status] {
+			return status
+		}
+		select {
+		case <-ctx.Done():
+			var got string
+			_ = h.pool.QueryRow(context.Background(),
+				"SELECT status FROM notifications WHERE id = $1", id,
+			).Scan(&got)
+			t.Fatalf("pollStatusAny: timed out after %s waiting for %v; got %q", deadline, statuses, got)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // publishDirect publishes a raw JSON body directly to the test exchange with
 // the given routing key and headers, bypassing the API. Used by idempotency
-// tests that need to inject duplicate messages.
+// tests that need to inject duplicate messages, and by Phase 4 poison tests.
 func (h *harness) publishDirect(t *testing.T, routingKey string, headers map[string]any, body []byte) {
 	t.Helper()
 
@@ -395,6 +575,65 @@ func (h *harness) publishDirect(t *testing.T, routingKey string, headers map[str
 	if err := pub.Publish(ctx, routingKey, headers, body); err != nil {
 		t.Fatalf("publishDirect: publish: %v", err)
 	}
+}
+
+// dlqMessageCount returns the number of messages in a DLQ queue via
+// QueueInspect. The queue must be using the topology prefix.
+func (h *harness) dlqMessageCount(t *testing.T, channel string) int {
+	t.Helper()
+	ch, err := h.rmqConn.Channel()
+	if err != nil {
+		t.Fatalf("dlqMessageCount: open channel: %v", err)
+	}
+	defer ch.Close()
+
+	qName := h.topo.DLQQueueName(channel)
+	q, err := ch.QueueInspect(qName)
+	if err != nil {
+		t.Fatalf("dlqMessageCount: inspect %s: %v", qName, err)
+	}
+	return q.Messages
+}
+
+// countDeliveryAttempts returns the number of delivery_attempts rows for a
+// notification.
+func (h *harness) countDeliveryAttempts(t *testing.T, notificationID string) int {
+	t.Helper()
+	var count int
+	err := h.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM delivery_attempts WHERE notification_id = $1`,
+		notificationID,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("countDeliveryAttempts: %v", err)
+	}
+	return count
+}
+
+// listAttemptStatuses returns the status column of all delivery_attempts for a
+// notification ordered by attempt_number, id.
+func (h *harness) listAttemptStatuses(t *testing.T, notificationID string) []string {
+	t.Helper()
+	rows, err := h.pool.Query(context.Background(),
+		`SELECT status FROM delivery_attempts
+		 WHERE notification_id = $1
+		 ORDER BY attempt_number ASC, id ASC`,
+		notificationID,
+	)
+	if err != nil {
+		t.Fatalf("listAttemptStatuses: %v", err)
+	}
+	defer rows.Close()
+
+	var statuses []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan attempt status: %v", err)
+		}
+		statuses = append(statuses, s)
+	}
+	return statuses
 }
 
 // ensureTestDB creates notifications_test if it does not exist.
@@ -446,3 +685,4 @@ func runMigrations(t *testing.T, dsn string) {
 		t.Fatalf("goose up: %v", err)
 	}
 }
+

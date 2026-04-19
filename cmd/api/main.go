@@ -88,6 +88,9 @@ func run() error {
 		Service:     svc,
 		Checkers:    []httpadapter.PingChecker{pgChecker{pool: pool}, rmqChecker{conn: rmqConn}},
 		RateLimiter: limiter,
+		// Admin routes: expose DLQ inspect and replay.
+		AMQPChannelProvider: rmqConn,
+		AdminPublisher:      publisher,
 	})
 
 	server := &http.Server{

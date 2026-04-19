@@ -33,6 +33,17 @@ type RouterDeps struct {
 	// RateLimiter applies per-channel ingress limits. If nil, no limiting is
 	// applied (useful in tests that don't need rate-limit behavior).
 	RateLimiter ChannelRateLimiter
+	// Admin fields — both must be non-nil to mount the /admin routes.
+	// AMQPChannelProvider opens fresh AMQP channels for DLQ inspect/replay.
+	AMQPChannelProvider AMQPChannelProvider
+	// AdminPublisher is the publisher used by DLQ replay to re-inject messages.
+	AdminPublisher AdminRetryPublisher
+	// AdminQueuePrefix is prepended to queue names in admin handlers. Empty in
+	// production; "test_" in e2e tests so admin routes target test-scoped queues.
+	AdminQueuePrefix string
+	// AdminMainExchange overrides the main exchange used for DLQ replay. Defaults
+	// to rabbitmq.ExchangeNotifications when empty.
+	AdminMainExchange string
 }
 
 // NewRouter builds and returns the chi router with the same middleware and
@@ -50,6 +61,20 @@ func NewRouter(deps RouterDeps) chi.Router {
 
 	NewHealthHandler(deps.Checkers...).Register(r)
 	NewNotificationHandler(deps.Service, log, deps.RateLimiter).Register(r)
+
+	if deps.AMQPChannelProvider != nil && deps.AdminPublisher != nil {
+		mainExchange := deps.AdminMainExchange
+		if mainExchange == "" {
+			mainExchange = rabbitmq.ExchangeNotifications
+		}
+		NewAdminHandler(
+			deps.AMQPChannelProvider,
+			deps.AdminPublisher,
+			mainExchange,
+			log,
+		).WithQueuePrefix(deps.AdminQueuePrefix).Register(r)
+	}
+
 	return r
 }
 

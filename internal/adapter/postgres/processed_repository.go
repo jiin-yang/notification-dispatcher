@@ -35,3 +35,16 @@ ON CONFLICT (message_id) DO NOTHING
 	}
 	return ct.RowsAffected() == 1, nil
 }
+
+// DeleteProcessed removes the dedup record for messageID so that the message
+// can be replayed from the DLQ. A no-op if the row does not exist.
+func (r *ProcessedRepository) DeleteProcessed(ctx context.Context, messageID uuid.UUID) error {
+	_, err := r.pool.Exec(ctx,
+		`DELETE FROM processed_messages WHERE message_id = $1`,
+		messageID,
+	)
+	if err != nil {
+		return fmt.Errorf("delete processed: %w", err)
+	}
+	return nil
+}

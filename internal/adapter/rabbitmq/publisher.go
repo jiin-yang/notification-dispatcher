@@ -25,15 +25,24 @@ func NewPublisher(ch *amqp.Channel, exchange string) (*Publisher, error) {
 	return &Publisher{ch: ch, exchange: exchange}, nil
 }
 
-// Publish sends a persistent message and waits for broker confirmation.
-// Returns an error if the broker nacks or the context expires.
+// Publish sends a persistent message to the publisher's exchange and waits for
+// broker confirmation. Returns an error if the broker nacks or the context
+// expires.
 func (p *Publisher) Publish(ctx context.Context, routingKey string, headers map[string]any, body []byte) error {
+	return p.PublishToExchange(ctx, p.exchange, routingKey, headers, body)
+}
+
+// PublishToExchange sends a persistent message to a named exchange (may differ
+// from the publisher's default exchange) and waits for broker confirmation.
+// Used by the retry/DLQ routing path where the consumer needs to address the
+// retry exchange or DLQ exchange directly.
+func (p *Publisher) PublishToExchange(ctx context.Context, exchange, routingKey string, headers map[string]any, body []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	conf, err := p.ch.PublishWithDeferredConfirmWithContext(
 		ctx,
-		p.exchange,
+		exchange,
 		routingKey,
 		true,  // mandatory
 		false, // immediate

@@ -63,7 +63,7 @@ func run() error {
 	}
 	_ = topoCh.Close()
 
-	// Build the provider registry — all channels routed to the webhook provider.
+	// Build the provider registry with circuit breakers.
 	webhook := provider.NewWebhookProvider(provider.WebhookOptions{
 		URL:     cfg.WebhookURL,
 		Timeout: cfg.WebhookTimeout,
@@ -73,11 +73,34 @@ func run() error {
 	reg.MustRegister(domain.ChannelSMS, webhook)
 	reg.MustRegister(domain.ChannelPush, webhook)
 
+	cbCfg := provider.CBConfig{
+		FailureThreshold: cfg.CBFailureThreshold,
+		OpenDuration:     cfg.CBOpenDuration,
+		HalfOpenMaxCalls: cfg.CBHalfOpenMaxCalls,
+	}
+	cbReg := provider.NewCircuitBreakerRegistry(reg, cbCfg, log)
+
 	notifRepo := postgres.NewNotificationRepository(pool)
 	processedRepo := postgres.NewProcessedRepository(pool)
+	attemptsRepo := postgres.NewDeliveryAttemptsRepository(pool)
 
-	deliver := app.NewDeliverUseCase(reg, notifRepo, log).
-		WithProcessedMarker(processedRepo)
+	// Dedicated publisher channel for retry/DLQ routing.
+	retryPubCh, err := rmqConn.Channel()
+	if err != nil {
+		return fmt.Errorf("open retry publisher channel: %w", err)
+	}
+	defer func() { _ = retryPubCh.Close() }()
+
+	retryPub, err := rabbitmq.NewPublisher(retryPubCh, rabbitmq.ExchangeNotifications)
+	if err != nil {
+		return fmt.Errorf("create retry publisher: %w", err)
+	}
+	retryAdapter := rabbitmq.NewRetryPublisherAdapter(retryPub, topo)
+
+	deliver := app.NewDeliverUseCase(cbReg, notifRepo, log).
+		WithProcessedMarker(processedRepo).
+		WithRetryPublisher(retryAdapter).
+		WithAttemptRecorder(attemptsRepo)
 
 	hostname, _ := os.Hostname()
 

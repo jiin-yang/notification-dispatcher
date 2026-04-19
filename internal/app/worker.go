@@ -39,7 +39,15 @@ func RunWorker(ctx context.Context, deps WorkerDeps) error {
 	g, gctx := errgroup.WithContext(ctx)
 
 	handler := func(ctx context.Context, d amqp.Delivery) error {
-		return deps.DeliverUseCase.Handle(ctx, d.Body, headerString(d.Headers, "correlation_id"))
+		attempt := headerInt32(d.Headers, "x-attempt")
+		originalRoutingKey := d.RoutingKey
+		return deps.DeliverUseCase.Handle(
+			ctx,
+			d.Body,
+			headerString(d.Headers, "correlation_id"),
+			int(attempt),
+			originalRoutingKey,
+		)
 	}
 
 	for _, c := range deps.Consumers {
@@ -60,4 +68,25 @@ func headerString(h amqp.Table, key string) string {
 		return v
 	}
 	return ""
+}
+
+func headerInt32(h amqp.Table, key string) int32 {
+	if h == nil {
+		return 0
+	}
+	switch v := h[key].(type) {
+	case int32:
+		return v
+	case int64:
+		return int32(v)
+	case int:
+		return int32(v)
+	case uint32:
+		return int32(v)
+	case uint64:
+		return int32(v)
+	case float64:
+		return int32(v)
+	}
+	return 0
 }

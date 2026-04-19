@@ -412,10 +412,19 @@ gider.
 - [ ] `migrations/0005_create_delivery_attempts.sql`: notification_id, attempt_number, status, error_reason, attempted_at, provider_response
 
 #### 4.6 Testler
-- [ ] Mock provider'a configurable failure rate → retry zinciri doğrulansın
-- [ ] DLQ replay → mesaj tekrar işlenir
-- [ ] Circuit breaker open iken consume hızla retry'a düşer
-- [ ] **Outbox revisit kararı:** bu faz sonunda güvenilirlik yeterli mi? Değilse outbox ekle (ayrı iş kartı).
+- [x] Mock provider'a configurable failure rate → retry zinciri doğrulansın
+- [x] DLQ replay → mesaj tekrar işlenir
+- [x] Circuit breaker open iken consume hızla retry'a düşer
+- [ ] **Outbox revisit kararı (ertelendi — Phase 4.5 veya Phase 5 görevi):**
+  Faz 4 sonunda publisher confirms + retry/DLQ zinciri güvenilir delivery
+  sağlıyor. Ancak şu iki başarısızlık hâlâ leak edebilir:
+  1. `POST /notifications`: DB insert başarılı, RMQ publish başarısız → row
+     `pending` kalır ama kuyrukta mesaj yoktur; retry olmadan takılı kalır.
+  2. `POST /notifications/batch`: aynı senaryo, toplu insert sonrası publish
+     hataları bazı satırları sonsuz `pending` bırakır.
+  Transactional outbox pattern (outbox tablosu + relay worker) bu
+  publish-after-commit açığını kapatır. Faz 5 gözlemlenebilirlik fazı ile
+  birlikte veya ayrı bir Faz 4.5 olarak planlanacak.
 
 ### Faz 4 Demo
 
