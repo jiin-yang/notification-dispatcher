@@ -148,9 +148,10 @@ type fakeRetryPublisher struct {
 }
 
 type retryCall struct {
-	channel string
-	level   int
-	attempt int
+	channel  string
+	priority string
+	level    int
+	attempt  int
 }
 
 type dlqCall struct {
@@ -158,8 +159,8 @@ type dlqCall struct {
 	attempt int
 }
 
-func (f *fakeRetryPublisher) PublishRetry(_ context.Context, channel string, level, attempt int, _ string, _ []byte) error {
-	f.retries = append(f.retries, retryCall{channel: channel, level: level, attempt: attempt})
+func (f *fakeRetryPublisher) PublishRetry(_ context.Context, channel, priority string, level, attempt int, _ string, _ []byte) error {
+	f.retries = append(f.retries, retryCall{channel: channel, priority: priority, level: level, attempt: attempt})
 	return nil
 }
 
@@ -175,7 +176,7 @@ func TestDeliver_WithRetryPublisher_RoutesToRetry(t *testing.T) {
 	uc := app.NewDeliverUseCase(prov, upd, nil).WithRetryPublisher(rp)
 
 	id := uuid.New()
-	// attempt=0 → nextAttempt=1 ≤ 3, should route to retry
+	// attempt=0 → retryLevel=1 ≤ 3, should route to retry
 	if err := uc.Handle(context.Background(), buildMessageBody(t, id), "corr", 0, "sms.normal"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -184,6 +185,10 @@ func TestDeliver_WithRetryPublisher_RoutesToRetry(t *testing.T) {
 	}
 	if len(rp.dlqs) != 0 {
 		t.Errorf("dlq publishes = %d, want 0", len(rp.dlqs))
+	}
+	// buildMessageBody uses PriorityNormal → priority must be preserved on retry.
+	if got := rp.retries[0].priority; got != "normal" {
+		t.Errorf("retry priority = %q, want %q", got, "normal")
 	}
 	// Status must not be changed to failed (left as pending for retry)
 	if _, ok := upd.statuses[id]; ok {

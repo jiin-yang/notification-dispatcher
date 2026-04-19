@@ -87,9 +87,11 @@ func (t Topology) DLQExchange() string {
 	return ExchangeDLQ
 }
 
-// RetryQueueName returns the queue name for channel+level, applying the prefix.
-func (t Topology) RetryQueueName(channel string, level int) string {
-	return fmt.Sprintf("%s%s.retry.%d", t.Prefix, channel, level)
+// RetryQueueName returns the queue name for channel+priority+level, applying
+// the prefix. Priority is embedded so that a high-priority message retried
+// re-enters the high-priority main queue rather than defaulting to normal.
+func (t Topology) RetryQueueName(channel, priority string, level int) string {
+	return fmt.Sprintf("%s%s.%s.retry.%d", t.Prefix, channel, priority, level)
 }
 
 // DLQQueueName returns the DLQ queue name for a channel.
@@ -163,39 +165,43 @@ func DeclareTopologyWith(ch *amqp.Channel, t Topology) error {
 	}
 
 	channels := []string{"email", "sms", "push"}
+	priorities := []string{"high", "normal", "low"}
 	ttls := []time.Duration{t.RetryTTLs.Level1, t.RetryTTLs.Level2, t.RetryTTLs.Level3}
 
 	for _, channel := range channels {
-		// retry queues: levels 1-3
-		for level := 1; level <= 3; level++ {
-			qName := t.RetryQueueName(channel, level)
-			ttlMs := int(ttls[level-1].Milliseconds())
-			// Re-entry into the main exchange uses the channel.normal routing key.
-			reEntryKey := channel + ".normal"
+		// retry queues: one per priority × level (3 × 3 = 9 per channel, 27 total)
+		for _, priority := range priorities {
+			for level := 1; level <= 3; level++ {
+				qName := t.RetryQueueName(channel, priority, level)
+				ttlMs := int(ttls[level-1].Milliseconds())
+				// Re-entry preserves priority: expired messages go back to the
+				// same priority queue they came from (e.g. email.high).
+				reEntryKey := channel + "." + priority
 
-			if _, err := ch.QueueDeclare(
-				qName,
-				true,  // durable
-				false, // auto-delete
-				false, // exclusive
-				false, // no-wait
-				amqp.Table{
-					"x-message-ttl":             int32(ttlMs),
-					"x-dead-letter-exchange":    t.Exchange,
-					"x-dead-letter-routing-key": reEntryKey,
-				},
-			); err != nil {
-				return fmt.Errorf("declare retry queue %s: %w", qName, err)
-			}
-			retryRoutingKey := fmt.Sprintf("%s.retry.%d", channel, level)
-			if err := ch.QueueBind(
-				qName,
-				retryRoutingKey,
-				ExchangeRetry,
-				false,
-				nil,
-			); err != nil {
-				return fmt.Errorf("bind retry queue %s: %w", qName, err)
+				if _, err := ch.QueueDeclare(
+					qName,
+					true,  // durable
+					false, // auto-delete
+					false, // exclusive
+					false, // no-wait
+					amqp.Table{
+						"x-message-ttl":             int32(ttlMs),
+						"x-dead-letter-exchange":    t.Exchange,
+						"x-dead-letter-routing-key": reEntryKey,
+					},
+				); err != nil {
+					return fmt.Errorf("declare retry queue %s: %w", qName, err)
+				}
+				retryRoutingKey := fmt.Sprintf("%s.%s.retry.%d", channel, priority, level)
+				if err := ch.QueueBind(
+					qName,
+					retryRoutingKey,
+					ExchangeRetry,
+					false,
+					nil,
+				); err != nil {
+					return fmt.Errorf("bind retry queue %s: %w", qName, err)
+				}
 			}
 		}
 
