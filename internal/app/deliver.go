@@ -47,6 +47,12 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 	n := msg.ToNotification()
 	if err := u.provider.Send(ctx, n); err != nil {
 		log.Error("delivery failed", "err", err)
+		if ctx.Err() != nil {
+			// Shutdown/cancellation: the delivery didn't actually fail
+			// terminally — don't mark the row or ack. Returning the error
+			// causes the consumer to nack so the broker requeues.
+			return err
+		}
 		if updateErr := u.updater.UpdateStatus(ctx, msg.ID, domain.StatusFailed); updateErr != nil {
 			log.Error("mark failed status failed", "err", updateErr)
 		}

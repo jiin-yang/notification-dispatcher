@@ -75,9 +75,10 @@ func run() error {
 	deliver := app.NewDeliverUseCase(webhook, repo, log)
 
 	consumer, err := rabbitmq.NewConsumer(consumeCh, rabbitmq.QueueDefault, rabbitmq.ConsumerOptions{
-		ConsumerTag:   "worker-" + os.Getenv("HOSTNAME"),
-		PrefetchCount: 10,
-		Logger:        log,
+		ConsumerTag:     "worker-" + os.Getenv("HOSTNAME"),
+		PrefetchCount:   10,
+		ShutdownTimeout: cfg.ShutdownTimeout,
+		Logger:          log,
 	})
 	if err != nil {
 		return fmt.Errorf("create consumer: %w", err)

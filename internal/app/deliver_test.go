@@ -103,6 +103,23 @@ func TestDeliver_TransientError(t *testing.T) {
 	}
 }
 
+func TestDeliver_ContextCanceled_DoesNotMarkFailed(t *testing.T) {
+	prov := &fakeProvider{err: context.Canceled}
+	upd := newFakeUpdater()
+	uc := app.NewDeliverUseCase(prov, upd, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := uc.Handle(ctx, buildMessageBody(t, uuid.New()), "corr")
+	if err == nil {
+		t.Fatal("want non-nil error so consumer nacks, got nil")
+	}
+	if len(upd.statuses) != 0 {
+		t.Errorf("status must not be updated on cancellation; got %v", upd.statuses)
+	}
+}
+
 func TestDeliver_BadBody(t *testing.T) {
 	prov := &fakeProvider{}
 	upd := newFakeUpdater()

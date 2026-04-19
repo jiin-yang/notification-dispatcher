@@ -84,3 +84,33 @@ func TestWebhookProvider_Send_TransportError(t *testing.T) {
 		t.Fatalf("want ErrDeliveryFailed on timeout, got %v", err)
 	}
 }
+
+func TestWebhookProvider_Send_ContextCanceled_NotTerminal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	p := provider.NewWebhookProvider(provider.WebhookOptions{URL: srv.URL, Timeout: time.Minute})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	err := p.Send(ctx, sampleNotification())
+	if err == nil {
+		t.Fatal("want error on cancellation, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+	if errors.Is(err, domain.ErrDeliveryFailed) {
+		t.Fatalf("cancellation must not be wrapped as ErrDeliveryFailed, got %v", err)
+	}
+}

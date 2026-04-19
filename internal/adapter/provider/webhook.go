@@ -63,6 +63,13 @@ func (p *WebhookProvider) Send(ctx context.Context, n domain.Notification) error
 
 	resp, err := p.client.Do(req)
 	if err != nil {
+		// A cancelled caller context isn't a terminal delivery failure — the
+		// broker should requeue the message (on channel close) rather than
+		// mark the row failed. Return the raw ctx error so deliver.go can
+		// distinguish this from a real transport failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("%w: webhook transport: %v", domain.ErrDeliveryFailed, err)
 	}
 	defer func() {
