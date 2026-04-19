@@ -249,10 +249,12 @@ func (h *harness) purgeAllQueues(t *testing.T) {
 
 	// Purge retry and DLQ queues (may not exist yet in non-phase4 tests — that's ok).
 	for _, channel := range []string{"email", "sms", "push"} {
-		for level := 1; level <= 3; level++ {
-			qName := h.topo.RetryQueueName(channel, level)
-			if _, err := ch.QueuePurge(qName, false); err != nil {
-				t.Logf("purge retry %s: %v (ok if queue doesn't exist)", qName, err)
+		for _, priority := range []string{"high", "normal", "low"} {
+			for level := 1; level <= 3; level++ {
+				qName := h.topo.RetryQueueName(channel, priority, level)
+				if _, err := ch.QueuePurge(qName, false); err != nil {
+					t.Logf("purge retry %s: %v (ok if queue doesn't exist)", qName, err)
+				}
 			}
 		}
 		dlqName := h.topo.DLQQueueName(channel)

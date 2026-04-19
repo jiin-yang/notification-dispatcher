@@ -49,8 +49,10 @@ type AttemptRecorder interface {
 // wires a *rabbitmq.Publisher to satisfy this interface. Keeping it here in the
 // app layer (DIP) means deliver.go never imports amqp091.
 type RetryPublisher interface {
-	// PublishRetry sends the body to the retry exchange at the given level (1-3).
-	PublishRetry(ctx context.Context, channel string, level int, attempt int, correlationID string, body []byte) error
+	// PublishRetry sends the body to the retry exchange at the given priority
+	// and level (1-3). priority is "high", "normal", or "low" and is used to
+	// route the message back to the correct priority queue after the TTL expires.
+	PublishRetry(ctx context.Context, channel string, priority string, level int, attempt int, correlationID string, body []byte) error
 	// PublishDLQ sends the body to the DLQ exchange.
 	PublishDLQ(ctx context.Context, channel string, attempt int, correlationID string, originalRoutingKey string, body []byte) error
 }
@@ -223,9 +225,10 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 	}
 
 	// Phase 4: route to retry or DLQ.
-	nextAttempt := attempt + 1
+	retryLevel := attempt + 1 // level == next attempt number (1-indexed, max 3)
+	priorityStr := string(msg.Priority)
 
-	if nextAttempt <= maxAttempts {
+	if retryLevel <= maxAttempts {
 		// Route to retry exchange.
 		status := "retrying"
 		errReason := sendErr.Error()
@@ -237,15 +240,15 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 			provResp = sendErr.Error()
 		}
 
-		if pubErr := u.retryPublisher.PublishRetry(ctx, string(msg.Channel), nextAttempt, nextAttempt, correlationID, body); pubErr != nil {
+		if pubErr := u.retryPublisher.PublishRetry(ctx, string(msg.Channel), priorityStr, retryLevel, retryLevel, correlationID, body); pubErr != nil {
 			log.Error("failed to publish to retry exchange", "err", pubErr)
 			return fmt.Errorf("retry publish: %w", pubErr)
 		}
 		u.recordAttempt(ctx, msg.ID, attempt, status, errReason, provResp)
 		if u.metrics != nil {
-			u.metrics.NotificationsRetried.WithLabelValues(string(msg.Channel), fmt.Sprintf("%d", nextAttempt)).Inc()
+			u.metrics.NotificationsRetried.WithLabelValues(string(msg.Channel), fmt.Sprintf("%d", retryLevel)).Inc()
 		}
-		log.Info("message routed to retry exchange", "next_attempt", nextAttempt)
+		log.Info("message routed to retry exchange", "next_attempt", retryLevel)
 		// Return nil so the consumer acks the original delivery.
 		return nil
 	}
@@ -253,7 +256,9 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 	// Exhausted retries → DLQ.
 	routingKey := originalRoutingKey
 	if routingKey == "" {
-		routingKey = string(msg.Channel) + ".normal"
+		// Preserve priority in the fallback key so admin replay re-enters the
+		// correct priority queue instead of always defaulting to normal.
+		routingKey = string(msg.Channel) + "." + priorityStr
 	}
 	if pubErr := u.retryPublisher.PublishDLQ(ctx, string(msg.Channel), attempt, correlationID, routingKey, body); pubErr != nil {
 		log.Error("failed to publish to DLQ", "err", pubErr)
