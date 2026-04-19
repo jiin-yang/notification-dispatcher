@@ -1,3 +1,0 @@
-package rabbitmq
-
-// reconnect logic

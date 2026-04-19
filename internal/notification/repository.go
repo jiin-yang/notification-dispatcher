@@ -1,3 +1,0 @@
-package notification
-
-// Repository interface
