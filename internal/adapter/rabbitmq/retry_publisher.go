@@ -30,8 +30,8 @@ func (a *RetryPublisherAdapter) PublishRetry(
 ) error {
 	routingKey := fmt.Sprintf("%s.retry.%d", channel, level)
 	headers := map[string]any{
-		"x-attempt":        int32(attempt),
-		"correlation_id":   correlationID,
+		"x-attempt":          int32(attempt),
+		"correlation_id":     correlationID,
 		"x-original-channel": channel,
 	}
 	if err := a.pub.PublishToExchange(ctx, ExchangeRetry, routingKey, headers, body); err != nil {

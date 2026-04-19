@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
+        with:
+          version: v2.11.4
+
+  test-unit:
+    name: test-unit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run unit tests
+        run: go test -count=1 -timeout 60s ./...
+
+  test-e2e:
+    name: test-e2e
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: notifier
+          POSTGRES_PASSWORD: notifier
+          POSTGRES_DB: notifications
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U notifier -d notifications"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 10s
+
+      rabbitmq:
+        image: rabbitmq:3.13-management
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install goose
+        run: go install github.com/pressly/goose/v3/cmd/goose@v3.27.0
+
+      - name: Create notifications_test database
+        env:
+          PGPASSWORD: notifier
+        run: psql -h localhost -U notifier -d postgres -c "CREATE DATABASE notifications_test;"
+
+      - name: Apply migrations to notifications_test
+        env:
+          GOOSE_DRIVER: postgres
+          GOOSE_DBSTRING: postgres://notifier:notifier@localhost:5432/notifications_test?sslmode=disable
+        run: goose -dir migrations up
+
+      - name: Run e2e tests
+        env:
+          TEST_DB_DSN: postgres://notifier:notifier@localhost:5432/notifications_test?sslmode=disable
+          TEST_RMQ_URL: amqp://guest:guest@localhost:5672/
+        run: go test -tags=e2e -count=1 -timeout 120s ./test/e2e/...
+
+  docker-build:
+    name: docker-build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: Dockerfile
+            build-args: SERVICE=api
+          - name: worker
+            dockerfile: Dockerfile
+            build-args: SERVICE=worker
+          - name: migrate
+            dockerfile: Dockerfile.migrate
+            build-args: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: ${{ matrix.build-args }}
+          push: false
+          load: false
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

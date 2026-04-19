@@ -1,5 +1,7 @@
 # notification-dispatcher
 
+[![CI](https://github.com/jiin-yang/notification-dispatcher/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jiin-yang/notification-dispatcher/actions/workflows/ci.yml)
+
 Event-driven notification dispatcher. The API accepts single or batch
 notification requests and publishes them to RabbitMQ. A worker pool consumes
 per-channel priority queues and delivers each message via an HTTP webhook,
@@ -176,6 +178,28 @@ make run-worker      # terminal 2
 - `make test-e2e` — spins up `notifications_test`, applies migrations,
   runs the `./test/e2e` suite against real Postgres + RabbitMQ.
 - `make test-all` — both. Gated on every push via `.githooks/pre-push`.
+
+## Continuous Integration
+
+Every push to `main` and every pull request runs four parallel jobs:
+
+- **lint** — `golangci-lint` (govet, staticcheck, errcheck, ineffassign,
+  unused, misspell, revive) via `.golangci.yml`.
+- **test-unit** — `go test ./...` with Go module and build cache.
+- **test-e2e** — GitHub Actions service containers (postgres:16 +
+  rabbitmq:3.13) run the full `./test/e2e` suite with real infra.
+- **docker-build** — BuildKit matrix build of `Dockerfile` (api + worker)
+  and `Dockerfile.migrate`, with GHA layer cache.
+
+Tagging `vX.Y.Z` triggers `.github/workflows/release.yml` which builds and
+pushes multi-arch images (linux/amd64 + linux/arm64) for api, worker, and
+migrate to GHCR (`ghcr.io/jiin-yang/notification-dispatcher-*`) with
+provenance and SBOM attestations, then creates a GitHub Release with
+auto-generated notes.
+
+A weekly security scan (`.github/workflows/security.yml`) runs CodeQL for
+Go and a Trivy filesystem scan for HIGH/CRITICAL CVEs; findings are uploaded
+to GitHub Code Scanning.
 
 The e2e harness uses a `test_` queue prefix and a dedicated database so
 parallel dev runs and e2e runs never collide.

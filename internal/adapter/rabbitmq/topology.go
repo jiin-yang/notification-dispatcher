@@ -180,8 +180,8 @@ func DeclareTopologyWith(ch *amqp.Channel, t Topology) error {
 				false, // exclusive
 				false, // no-wait
 				amqp.Table{
-					"x-message-ttl":          int32(ttlMs),
-					"x-dead-letter-exchange": t.Exchange,
+					"x-message-ttl":             int32(ttlMs),
+					"x-dead-letter-exchange":    t.Exchange,
 					"x-dead-letter-routing-key": reEntryKey,
 				},
 			); err != nil {

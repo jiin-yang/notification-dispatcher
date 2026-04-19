@@ -22,9 +22,9 @@ type Config struct {
 	RateLimitBurst     int     `env:"RATE_LIMIT_BURST"         envDefault:"200"`
 
 	// Circuit breaker settings (Phase 4). One breaker per channel.
-	CBFailureThreshold  uint32        `env:"CB_FAILURE_THRESHOLD"     envDefault:"5"`
-	CBOpenDuration      time.Duration `env:"CB_OPEN_DURATION"         envDefault:"30s"`
-	CBHalfOpenMaxCalls  uint32        `env:"CB_HALF_OPEN_MAX_CALLS"   envDefault:"2"`
+	CBFailureThreshold uint32        `env:"CB_FAILURE_THRESHOLD"     envDefault:"5"`
+	CBOpenDuration     time.Duration `env:"CB_OPEN_DURATION"         envDefault:"30s"`
+	CBHalfOpenMaxCalls uint32        `env:"CB_HALF_OPEN_MAX_CALLS"   envDefault:"2"`
 }
 
 func Load() (Config, error) {

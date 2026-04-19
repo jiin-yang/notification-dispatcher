@@ -1,0 +1,35 @@
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: main
+    groups:
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: main
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: main
+    groups:
+      docker-minor-patch:
+        update-types:
+          - minor
+          - patch

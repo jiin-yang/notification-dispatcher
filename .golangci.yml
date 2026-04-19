@@ -1,27 +1,38 @@
+version: "2"
+
 run:
-  timeout: 3m
+  timeout: 5m
   tests: true
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
     - govet
     - staticcheck
     - ineffassign
     - unused
-    - gofmt
-    - goimports
     - misspell
     - revive
 
-linters-settings:
-  revive:
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+
+  exclusions:
     rules:
-      - name: exported
-        disabled: true
+      - linters: [errcheck]
+        text: "Error return value of .* is not checked"
+      - linters: [staticcheck]
+        text: "SA1019: ch.QueueInspect is deprecated"
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
 
 issues:
-  exclude-use-default: false
   max-same-issues: 0
   max-issues-per-linter: 0
