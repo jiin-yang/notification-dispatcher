@@ -31,6 +31,9 @@ type Metrics struct {
 	NotificationsInFlight  prometheus.Gauge
 
 	CircuitBreakerState *prometheus.GaugeVec // labels: channel; 0=closed 1=half_open 2=open
+
+	// Worker supervisor metrics.
+	ConsumerRestarts *prometheus.CounterVec // labels: queue
 }
 
 // New constructs a Metrics bundle with its own registry. service is exposed
@@ -110,6 +113,12 @@ func New(service string) *Metrics {
 			Help:        "Circuit breaker state per channel (0=closed, 1=half_open, 2=open).",
 			ConstLabels: constLabels,
 		}, []string{"channel"}),
+
+		ConsumerRestarts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "consumer_restarts_total",
+			Help:        "Number of times a consumer supervisor restarted the consumer after a failure.",
+			ConstLabels: constLabels,
+		}, []string{"queue"}),
 	}
 
 	reg.MustRegister(
@@ -126,6 +135,7 @@ func New(service string) *Metrics {
 		m.DeliveryDuration,
 		m.NotificationsInFlight,
 		m.CircuitBreakerState,
+		m.ConsumerRestarts,
 	)
 
 	return m

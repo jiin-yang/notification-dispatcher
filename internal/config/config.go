@@ -25,6 +25,12 @@ type Config struct {
 	CBFailureThreshold uint32        `env:"CB_FAILURE_THRESHOLD"     envDefault:"5"`
 	CBOpenDuration     time.Duration `env:"CB_OPEN_DURATION"         envDefault:"30s"`
 	CBHalfOpenMaxCalls uint32        `env:"CB_HALF_OPEN_MAX_CALLS"   envDefault:"2"`
+
+	// Per-queue consumer concurrency. Controls how many messages each queue
+	// consumer processes in parallel. PrefetchCount is raised to match if lower.
+	EmailConcurrency int `env:"EMAIL_CONCURRENCY" envDefault:"1"`
+	SMSConcurrency   int `env:"SMS_CONCURRENCY"   envDefault:"1"`
+	PushConcurrency  int `env:"PUSH_CONCURRENCY"  envDefault:"5"`
 }
 
 func Load() (Config, error) {

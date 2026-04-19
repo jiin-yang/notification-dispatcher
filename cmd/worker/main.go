@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -124,9 +125,15 @@ func run() error {
 		}
 		defer func() { _ = consumeCh.Close() }()
 
+		c := concurrencyFor(b.Queue, cfg)
+		prefetch := 10
+		if c > prefetch {
+			prefetch = c
+		}
 		consumer, err := rabbitmq.NewConsumer(consumeCh, b.Queue, rabbitmq.ConsumerOptions{
 			ConsumerTag:     fmt.Sprintf("worker-%s-%s-%d", hostname, b.Queue, i),
-			PrefetchCount:   10,
+			PrefetchCount:   prefetch,
+			Concurrency:     c,
 			ShutdownTimeout: cfg.ShutdownTimeout,
 			Logger:          log,
 		})
@@ -134,7 +141,7 @@ func run() error {
 			return fmt.Errorf("create consumer for %s: %w", b.Queue, err)
 		}
 		consumers = append(consumers, consumer)
-		log.Info("consumer registered", "queue", b.Queue)
+		log.Info("consumer registered", "queue", b.Queue, "concurrency", c)
 	}
 
 	// Serve /metrics and /health/live from the worker process so scrapers and
@@ -164,6 +171,7 @@ func run() error {
 		Consumers:      consumers,
 		DeliverUseCase: deliver,
 		Logger:         log,
+		Metrics:        m,
 	})
 }
 
@@ -199,6 +207,21 @@ func reportBreakerStates(ctx context.Context, cbReg *provider.CircuitBreakerRegi
 				m.CircuitBreakerState.WithLabelValues(string(ch)).Set(v)
 			}
 		}
+	}
+}
+
+// concurrencyFor maps a queue name to its configured concurrency. The queue
+// name prefix (email/sms/push) selects which env-based value to use.
+func concurrencyFor(queue string, cfg config.Config) int {
+	switch {
+	case strings.HasPrefix(queue, "email"):
+		return cfg.EmailConcurrency
+	case strings.HasPrefix(queue, "sms"):
+		return cfg.SMSConcurrency
+	case strings.HasPrefix(queue, "push"):
+		return cfg.PushConcurrency
+	default:
+		return 1
 	}
 }
 

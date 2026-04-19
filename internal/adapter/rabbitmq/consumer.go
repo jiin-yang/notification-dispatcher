@@ -4,21 +4,31 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // Handler processes a single delivery. Returning nil acks; returning an error
-// nacks without requeue. Phase 4 will introduce retry-exchange routing.
+// nacks without requeue.
 type Handler func(ctx context.Context, d amqp.Delivery) error
 
+// AMQPChannel is the subset of *amqp.Channel the Consumer needs. Keeping it
+// narrow allows tests to substitute a fake without a live broker.
+type AMQPChannel interface {
+	Qos(prefetchCount, prefetchSize int, global bool) error
+	ConsumeWithContext(ctx context.Context, queue, consumer string, autoAck, exclusive, noLocal, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
+	Cancel(consumer string, noWait bool) error
+}
+
 type Consumer struct {
-	ch              *amqp.Channel
+	ch              AMQPChannel
 	queue           string
 	consumerTag     string
 	prefetchCount   int
 	shutdownTimeout time.Duration
+	sem             chan struct{}
 	logger          *slog.Logger
 }
 
@@ -26,12 +36,33 @@ type ConsumerOptions struct {
 	ConsumerTag     string
 	PrefetchCount   int
 	ShutdownTimeout time.Duration
-	Logger          *slog.Logger
+	// Concurrency is the maximum number of messages processed in parallel.
+	// Defaults to 1. If PrefetchCount < Concurrency, PrefetchCount is raised
+	// to match so the broker can fill the semaphore.
+	Concurrency int
+	Logger      *slog.Logger
 }
 
-func NewConsumer(ch *amqp.Channel, queue string, opts ConsumerOptions) (*Consumer, error) {
+// NewConsumer creates a Consumer. ch must not be shared across goroutines.
+// *amqp.Channel satisfies AMQPChannel.
+func NewConsumer(ch AMQPChannel, queue string, opts ConsumerOptions) (*Consumer, error) {
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = 1
+	}
 	if opts.PrefetchCount <= 0 {
 		opts.PrefetchCount = 10
+	}
+	// Invariant: PrefetchCount must be >= Concurrency; otherwise the broker
+	// never sends enough messages to keep all goroutine slots busy.
+	if opts.PrefetchCount < opts.Concurrency {
+		if opts.Logger != nil {
+			opts.Logger.Warn("PrefetchCount raised to match Concurrency",
+				"queue", queue,
+				"old_prefetch", opts.PrefetchCount,
+				"new_prefetch", opts.Concurrency,
+			)
+		}
+		opts.PrefetchCount = opts.Concurrency
 	}
 	if opts.ShutdownTimeout <= 0 {
 		opts.ShutdownTimeout = 10 * time.Second
@@ -48,9 +79,13 @@ func NewConsumer(ch *amqp.Channel, queue string, opts ConsumerOptions) (*Consume
 		consumerTag:     opts.ConsumerTag,
 		prefetchCount:   opts.PrefetchCount,
 		shutdownTimeout: opts.ShutdownTimeout,
+		sem:             make(chan struct{}, opts.Concurrency),
 		logger:          opts.Logger,
 	}, nil
 }
+
+// QueueName returns the queue this consumer is attached to.
+func (c *Consumer) QueueName() string { return c.queue }
 
 // Run blocks until ctx is cancelled or the delivery channel closes. On
 // cancellation it stops accepting new deliveries and drains in-flight
@@ -90,23 +125,43 @@ func (c *Consumer) drain(deliveries <-chan amqp.Delivery, handle Handler) error 
 	}
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), c.shutdownTimeout)
 	defer cancelDrain()
+
+	var wg sync.WaitGroup
 	for {
 		select {
 		case <-drainCtx.Done():
 			c.logger.Warn("drain timeout; unacked deliveries will be requeued by broker",
 				"timeout", c.shutdownTimeout,
 			)
+			wg.Wait()
 			return nil
 		case d, ok := <-deliveries:
 			if !ok {
+				wg.Wait()
 				return nil
 			}
-			c.process(drainCtx, d, handle)
+			wg.Add(1)
+			go func(del amqp.Delivery) {
+				defer wg.Done()
+				c.processSync(drainCtx, del, handle)
+			}(d)
 		}
 	}
 }
 
+// process acquires a semaphore slot and spawns a goroutine to handle the
+// delivery. The goroutine owns the ack/nack so the caller never blocks on
+// slow handlers.
 func (c *Consumer) process(ctx context.Context, d amqp.Delivery, handle Handler) {
+	c.sem <- struct{}{}
+	go func() {
+		defer func() { <-c.sem }()
+		c.processSync(ctx, d, handle)
+	}()
+}
+
+// processSync runs the handler synchronously and acks or nacks the delivery.
+func (c *Consumer) processSync(ctx context.Context, d amqp.Delivery, handle Handler) {
 	if err := handle(ctx, d); err != nil {
 		c.logger.Error("handler failed", "err", err, "routing_key", d.RoutingKey)
 		if nackErr := d.Nack(false, false); nackErr != nil {
