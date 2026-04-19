@@ -54,15 +54,15 @@ dev-ps:
 
 .PHONY: migrate-up
 migrate-up:
-	goose -dir $(MIGRATIONS_DIR) $(GOOSE_DRIVER) "$(GOOSE_DBSTRING)" up
+	goose -dir $(MIGRATIONS_DIR) up
 
 .PHONY: migrate-down
 migrate-down:
-	goose -dir $(MIGRATIONS_DIR) $(GOOSE_DRIVER) "$(GOOSE_DBSTRING)" down
+	goose -dir $(MIGRATIONS_DIR) down
 
 .PHONY: migrate-status
 migrate-status:
-	goose -dir $(MIGRATIONS_DIR) $(GOOSE_DRIVER) "$(GOOSE_DBSTRING)" status
+	goose -dir $(MIGRATIONS_DIR) status
 
 .PHONY: migrate-create
 migrate-create:
