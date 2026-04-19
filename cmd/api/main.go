@@ -4,14 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	httpadapter "github.com/jiin-yang/notification-dispatcher/internal/adapter/http"
@@ -80,7 +78,11 @@ func run() error {
 	repo := pgadapter.NewNotificationRepository(pool)
 	svc := app.NewNotificationService(repo, publisher)
 
-	router := buildRouter(log, pool, rmqConn, svc)
+	router := httpadapter.NewRouter(httpadapter.RouterDeps{
+		Logger:   log,
+		Service:  svc,
+		Checkers: []httpadapter.PingChecker{pgChecker{pool: pool}, rmqChecker{conn: rmqConn}},
+	})
 
 	server := &http.Server{
 		Addr:              ":" + cfg.HTTPPort,
@@ -115,29 +117,10 @@ func run() error {
 	return nil
 }
 
-func buildRouter(
-	log *slog.Logger,
-	pool *pgxpool.Pool,
-	rmqConn *rabbitmq.Connection,
-	svc *app.NotificationService,
-) chi.Router {
-	r := chi.NewRouter()
-	r.Use(httpadapter.CorrelationID)
-	r.Use(httpadapter.RequestLogger(log))
-
-	httpadapter.NewHealthHandler(
-		pgChecker{pool: pool},
-		rmqChecker{conn: rmqConn},
-	).Register(r)
-
-	httpadapter.NewNotificationHandler(svc, log).Register(r)
-	return r
-}
-
 type pgChecker struct{ pool *pgxpool.Pool }
 
-func (c pgChecker) Name() string                            { return "postgres" }
-func (c pgChecker) Ping(ctx context.Context) error          { return c.pool.Ping(ctx) }
+func (c pgChecker) Name() string               { return "postgres" }
+func (c pgChecker) Ping(ctx context.Context) error { return c.pool.Ping(ctx) }
 
 type rmqChecker struct{ conn *rabbitmq.Connection }
 

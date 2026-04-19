@@ -8,8 +8,6 @@ import (
 	"syscall"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
-
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/postgres"
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/provider"
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/rabbitmq"
@@ -86,19 +84,9 @@ func run() error {
 	}
 
 	log.Info("consuming", "queue", rabbitmq.QueueDefault)
-	runErr := consumer.Run(rootCtx, func(ctx context.Context, d amqp.Delivery) error {
-		return deliver.Handle(ctx, d.Body, headerString(d.Headers, "correlation_id"))
+	return app.RunWorker(rootCtx, app.WorkerDeps{
+		Consumer:       consumer,
+		DeliverUseCase: deliver,
+		Logger:         log,
 	})
-	log.Info("worker stopped")
-	return runErr
-}
-
-func headerString(h amqp.Table, key string) string {
-	if h == nil {
-		return ""
-	}
-	if v, ok := h[key].(string); ok {
-		return v
-	}
-	return ""
 }

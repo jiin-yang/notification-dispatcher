@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Consume and discard stdin — git sends ref data here, we don't need it.
+cat - > /dev/null
+
+echo "[pre-push] Running full test suite before push..."
+
+if ! make test-all; then
+  echo ""
+  echo "[pre-push] PUSH BLOCKED: test-all failed."
+  echo "  Fix the failing tests, then push again."
+  echo "  Emergency bypass (use only when tests are genuinely inapplicable to this push):"
+  echo "    git push --no-verify"
+  exit 1
+fi
+
+echo "[pre-push] All tests passed. Proceeding with push."
