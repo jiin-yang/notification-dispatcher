@@ -249,29 +249,33 @@ batch query, idempotency) — hâlâ email/normal üzerinde.
 ### Taskler
 
 #### 2.1 DB Değişiklikleri
-- [ ] `migrations/0002_create_batches.sql`: `batches` tablosu (id, total_count, pending_count, delivered_count, failed_count, cancelled_count, created_at)
-- [ ] `migrations/0003_add_batch_id_and_idempotency.sql`: `notifications.batch_id` (nullable FK), `notifications.idempotency_key` (unique nullable)
-- [ ] Index: `(status, created_at)`, `(channel, status)`, `batch_id`
+- [x] `migrations/0002_create_batches.sql`: `batches` tablosu (id, total_count, created_at)
+- [x] `migrations/0003_add_batch_id_and_idempotency.sql`: `notifications.batch_id` (nullable FK), `notifications.idempotency_key` (unique nullable)
+- [x] Index: `(channel, status)`, `batch_id`, unique partial on `idempotency_key`
 
 #### 2.2 Repository
-- [ ] `InsertBatch(notifications []Notification)` — tek transaction, bulk insert
-- [ ] `GetBatchSummary(batchID)` — counter'ları dinamik sorgu ile getir (basit)
-- [ ] `List(filter, page, limit)` — cursor-based veya offset-based (offset daha basit, onunla başla)
-- [ ] `UpdateStatusIfPending(id, newStatus)` — cancel için conditional update
-- [ ] `GetByIdempotencyKey(key)` — var mı kontrolü
+- [x] `InsertBatch(batchID, []Notification)` — tek transaction, pgx.CopyFrom bulk insert
+- [x] `GetBatchSummary(batchID)` — GROUP BY status ile dinamik sayım
+- [x] `List(filter, page, limit)` — offset-based pagination, read-only tx
+- [x] `CancelIfPending(id)` — conditional UPDATE RETURNING, ErrNotFound / ErrNotPending
+- [x] `GetByIdempotencyKey(key)` — lookup ile idempotency
 
 #### 2.3 API Handler
-- [ ] `POST /notifications/batch` — max 1000 validation, bulk insert, her biri için publish
-- [ ] `GET /notifications/batch/{id}` — özet döner
-- [ ] `GET /notifications` — query param parse, filtre validation, pagination response (total, page, limit, items)
-- [ ] `DELETE /notifications/{id}` — sadece pending → status=cancelled, değilse 409
-- [ ] Idempotency middleware: `Idempotency-Key` header varsa önce lookup, varsa eski sonucu döner
+- [x] `POST /notifications/batch` — max 1000 validation, bulk insert, her biri için publish
+- [x] `GET /notifications/batch/{batchId}` — özet döner
+- [x] `GET /notifications` — query param parse, filtre validation, pagination response (total, page, limit, items)
+- [x] `DELETE /notifications/{id}` — sadece pending → status=cancelled, değilse 409
+- [x] Idempotency: `Idempotency-Key` header varsa önce lookup, varsa eski sonucu döner (inline in handler)
 
 #### 2.4 Testler
-- [ ] Batch insert transactional rollback testi
-- [ ] Idempotency — aynı key ile iki istek, tek kayıt
-- [ ] Cancel — pending cancel edilir, delivered cancel edilemez (409)
-- [ ] List filter kombinasyonları
+- [x] Batch happy path — 3 notification, tümü delivered, summary doğrulandı
+- [x] Batch validation error — kötü phone, 400, hiç satır yok
+- [x] Batch size cap — 1001 item → 400
+- [x] Idempotency — aynı key ile iki istek, tek kayıt, tek publish
+- [x] Cancel pending — worker yok, satır pending kalır, DELETE → 200 cancelled
+- [x] Cancel non-pending (delivered) → 409
+- [x] Cancel unknown id → 404
+- [x] List filter + pagination — channel=sms, limit=2, page=1/2 doğrulandı
 
 ### Faz 2 Demo
 

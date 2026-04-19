@@ -116,14 +116,36 @@ func (h *harness) close() {
 	h.pool.Close()
 }
 
-// reset truncates the DB and purges the test queue so each subtest starts
-// with no leftover rows or stale messages from previous runs.
+// reset truncates the notifications table and purges the test queue so each
+// subtest starts with no leftover rows or stale messages from previous runs.
+// Phase 1 subtests call this; Phase 2 subtests call resetFull which also
+// clears the batches table.
 func (h *harness) reset(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE notifications"); err != nil {
 		t.Fatalf("truncate notifications: %v", err)
+	}
+	ch, err := h.rmqConn.Channel()
+	if err != nil {
+		t.Fatalf("open channel for purge: %v", err)
+	}
+	defer ch.Close()
+	if _, err := ch.QueuePurge(h.topo.Queue, false); err != nil {
+		t.Fatalf("purge test queue: %v", err)
+	}
+}
+
+// resetFull truncates both notifications and batches (which notifications
+// references via FK) and purges the queue.
+func (h *harness) resetFull(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// TRUNCATE ... CASCADE handles the FK from notifications.batch_id → batches.id.
+	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE batches CASCADE"); err != nil {
+		t.Fatalf("truncate batches: %v", err)
 	}
 	ch, err := h.rmqConn.Channel()
 	if err != nil {

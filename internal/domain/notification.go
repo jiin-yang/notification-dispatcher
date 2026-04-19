@@ -44,16 +44,27 @@ const (
 	StatusPending   Status = "pending"
 	StatusDelivered Status = "delivered"
 	StatusFailed    Status = "failed"
+	StatusCancelled Status = "cancelled"
 )
 
+func (s Status) Valid() bool {
+	switch s {
+	case StatusPending, StatusDelivered, StatusFailed, StatusCancelled:
+		return true
+	}
+	return false
+}
+
 type Notification struct {
-	ID            uuid.UUID
-	Recipient     string
-	Channel       Channel
-	Content       string
-	Priority      Priority
-	Status        Status
-	CorrelationID uuid.UUID
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID             uuid.UUID
+	Recipient      string
+	Channel        Channel
+	Content        string
+	Priority       Priority
+	Status         Status
+	CorrelationID  uuid.UUID
+	BatchID        *uuid.UUID
+	IdempotencyKey *string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
