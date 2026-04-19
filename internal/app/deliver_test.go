@@ -218,6 +218,67 @@ func TestDeliver_WithRetryPublisher_RoutesToDLQ(t *testing.T) {
 	}
 }
 
+func TestDeliver_RetryPriority_FromRoutingKey_WhenBodyMissing(t *testing.T) {
+	// Message body has no priority field (e.g. old client, manual replay),
+	// but the routing key carries the authoritative priority. Retry must
+	// re-enter the correct priority queue rather than defaulting to normal.
+	prov := &fakeProvider{err: wrapped{domain.ErrDeliveryFailed}}
+	upd := newFakeUpdater()
+	rp := &fakeRetryPublisher{}
+	uc := app.NewDeliverUseCase(prov, upd, nil).WithRetryPublisher(rp)
+
+	body, err := json.Marshal(app.NotificationMessage{
+		ID:        uuid.New(),
+		Recipient: "a@b.c",
+		Channel:   domain.ChannelEmail,
+		Content:   "hi",
+		// Priority intentionally omitted.
+		CorrelationID: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if err := uc.Handle(context.Background(), body, "corr", 0, "email.high"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rp.retries) != 1 {
+		t.Fatalf("retry publishes = %d, want 1", len(rp.retries))
+	}
+	if got := rp.retries[0].priority; got != "high" {
+		t.Errorf("retry priority = %q, want %q (derived from routing key)", got, "high")
+	}
+}
+
+func TestDeliver_RetryPriority_RoutingKeyWinsOverBody(t *testing.T) {
+	// Body and routing key disagree (possible after admin replay with edited
+	// routing key). The routing key is authoritative since it is what the
+	// broker used to land the message on this queue.
+	prov := &fakeProvider{err: wrapped{domain.ErrDeliveryFailed}}
+	upd := newFakeUpdater()
+	rp := &fakeRetryPublisher{}
+	uc := app.NewDeliverUseCase(prov, upd, nil).WithRetryPublisher(rp)
+
+	body, err := json.Marshal(app.NotificationMessage{
+		ID:            uuid.New(),
+		Recipient:     "a@b.c",
+		Channel:       domain.ChannelEmail,
+		Content:       "hi",
+		Priority:      domain.PriorityLow, // body says low
+		CorrelationID: uuid.New(),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if err := uc.Handle(context.Background(), body, "corr", 0, "email.high"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := rp.retries[0].priority; got != "high" {
+		t.Errorf("retry priority = %q, want %q (routing key must win over body)", got, "high")
+	}
+}
+
 func TestDeliver_BadBody_WithRetryPublisher(t *testing.T) {
 	prov := &fakeProvider{}
 	upd := newFakeUpdater()

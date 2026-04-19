@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -226,7 +227,7 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 
 	// Phase 4: route to retry or DLQ.
 	retryLevel := attempt + 1 // level == next attempt number (1-indexed, max 3)
-	priorityStr := string(msg.Priority)
+	priorityStr := resolvePriority(originalRoutingKey, msg.Priority, log)
 
 	if retryLevel <= maxAttempts {
 		// Route to retry exchange.
@@ -306,4 +307,39 @@ func channelFromRoutingKey(key string) string {
 		}
 	}
 	return "unknown"
+}
+
+// priorityFromRoutingKey extracts the priority segment from a routing key.
+// Accepts "channel.priority" or "channel.priority.retry.N"; returns "" if the
+// second segment is not a known priority.
+func priorityFromRoutingKey(key string) string {
+	parts := strings.SplitN(key, ".", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	switch parts[1] {
+	case string(domain.PriorityHigh), string(domain.PriorityNormal), string(domain.PriorityLow):
+		return parts[1]
+	}
+	return ""
+}
+
+// resolvePriority picks a single authoritative priority for retry/DLQ routing.
+// The routing key is the authoritative source because it is what the broker
+// used to land the message on this queue; msg.Priority is only a fallback for
+// callers (e.g. bad actors or tests) that construct a body directly. If both
+// are empty or unknown, logs a warning and defaults to "normal" so the retry
+// path stays intact rather than publishing to an unbound routing key.
+func resolvePriority(routingKey string, msgPriority domain.Priority, log *slog.Logger) string {
+	if p := priorityFromRoutingKey(routingKey); p != "" {
+		return p
+	}
+	if msgPriority.Valid() {
+		return string(msgPriority)
+	}
+	log.Warn("priority missing from routing key and message body; defaulting to normal",
+		"routing_key", routingKey,
+		"msg_priority", string(msgPriority),
+	)
+	return string(domain.PriorityNormal)
 }
