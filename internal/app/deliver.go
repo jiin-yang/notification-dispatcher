@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/jiin-yang/notification-dispatcher/internal/domain"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/metrics"
 )
 
 // ErrCircuitOpen is the app-layer sentinel for circuit-breaker fast-fail. The
@@ -60,9 +62,10 @@ const maxAttempts = 3
 type DeliverUseCase struct {
 	provider       domain.Provider
 	updater        StatusUpdater
-	processed      ProcessedMarker // may be nil (no dedup)
-	retryPublisher RetryPublisher  // may be nil (Phase 1/2/3 compat)
-	attempts       AttemptRecorder // may be nil
+	processed      ProcessedMarker  // may be nil (no dedup)
+	retryPublisher RetryPublisher   // may be nil (Phase 1/2/3 compat)
+	attempts       AttemptRecorder  // may be nil
+	metrics        *metrics.Metrics // may be nil (no metric emission)
 	logger         *slog.Logger
 }
 
@@ -94,6 +97,12 @@ func (u *DeliverUseCase) WithAttemptRecorder(ar AttemptRecorder) *DeliverUseCase
 	return u
 }
 
+// WithMetrics wires a Prometheus metric sink. Optional.
+func (u *DeliverUseCase) WithMetrics(m *metrics.Metrics) *DeliverUseCase {
+	u.metrics = m
+	return u
+}
+
 // Handle processes a single notification message. It is safe to call
 // concurrently; downstream repository and provider are expected to handle
 // their own concurrency.
@@ -117,9 +126,17 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 			if pubErr := u.retryPublisher.PublishDLQ(ctx, channel, attempt, correlationID, originalRoutingKey, body); pubErr != nil {
 				u.logger.Error("failed to publish poison message to DLQ", "err", pubErr)
 			}
+			if u.metrics != nil {
+				u.metrics.NotificationsDLQ.WithLabelValues(channel, "poison").Inc()
+			}
 			return nil // ack — message is unprocessable
 		}
 		return fmt.Errorf("unmarshal message: %w", err)
+	}
+
+	if u.metrics != nil {
+		u.metrics.NotificationsInFlight.Inc()
+		defer u.metrics.NotificationsInFlight.Dec()
 	}
 
 	log := u.logger.With(
@@ -146,9 +163,15 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 	}
 
 	n := msg.ToNotification()
+	sendStart := time.Now()
 	sendErr := u.provider.Send(ctx, n)
+	sendDuration := time.Since(sendStart).Seconds()
 
 	if sendErr == nil {
+		if u.metrics != nil {
+			u.metrics.DeliveryDuration.WithLabelValues(string(msg.Channel), "success").Observe(sendDuration)
+			u.metrics.NotificationsDelivered.WithLabelValues(string(msg.Channel), "success").Inc()
+		}
 		if err := u.updater.UpdateStatus(ctx, msg.ID, domain.StatusDelivered); err != nil {
 			log.Error("mark delivered status failed", "err", err)
 			return err
@@ -156,6 +179,14 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 		u.recordAttempt(ctx, msg.ID, attempt, "success", "", "")
 		log.Info("delivered")
 		return nil
+	}
+
+	if u.metrics != nil {
+		outcome := "failure"
+		if errors.Is(sendErr, ErrCircuitOpen) {
+			outcome = "circuit_open"
+		}
+		u.metrics.DeliveryDuration.WithLabelValues(string(msg.Channel), outcome).Observe(sendDuration)
 	}
 
 	// Provider returned an error.
@@ -183,6 +214,9 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 			if err := u.updater.UpdateStatus(ctx, msg.ID, domain.StatusFailed); err != nil {
 				log.Error("mark failed status failed", "err", err)
 			}
+			if u.metrics != nil {
+				u.metrics.NotificationsDelivered.WithLabelValues(string(msg.Channel), "failed").Inc()
+			}
 			return nil // ack
 		}
 		return sendErr // nack — transient error
@@ -208,6 +242,9 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 			return fmt.Errorf("retry publish: %w", pubErr)
 		}
 		u.recordAttempt(ctx, msg.ID, attempt, status, errReason, provResp)
+		if u.metrics != nil {
+			u.metrics.NotificationsRetried.WithLabelValues(string(msg.Channel), fmt.Sprintf("%d", nextAttempt)).Inc()
+		}
 		log.Info("message routed to retry exchange", "next_attempt", nextAttempt)
 		// Return nil so the consumer acks the original delivery.
 		return nil
@@ -234,6 +271,14 @@ func (u *DeliverUseCase) Handle(ctx context.Context, body []byte, correlationID 
 		}
 	}
 	u.recordAttempt(ctx, msg.ID, attempt, "dlq", sendErr.Error(), "")
+	if u.metrics != nil {
+		reason := "failed"
+		if isCircuitOpen {
+			reason = "circuit_open"
+		}
+		u.metrics.NotificationsDLQ.WithLabelValues(string(msg.Channel), reason).Inc()
+		u.metrics.NotificationsDelivered.WithLabelValues(string(msg.Channel), "failed").Inc()
+	}
 	log.Info("message routed to DLQ", "attempt", attempt)
 	return nil // ack
 }

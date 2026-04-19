@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.idea
+bin
+test
+*.md
+Makefile
+.env
+.env.*
+!/migrations

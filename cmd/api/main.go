@@ -19,6 +19,7 @@ import (
 	"github.com/jiin-yang/notification-dispatcher/internal/config"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform/logger"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/metrics"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform/ratelimit"
 )
 
@@ -82,12 +83,14 @@ func run() error {
 	svc := app.NewNotificationService(repo, publisher)
 
 	limiter := ratelimit.New(cfg.RateLimitPerSecond, cfg.RateLimitBurst)
+	m := metrics.New("api")
 
 	router := httpadapter.NewRouter(httpadapter.RouterDeps{
 		Logger:      log,
 		Service:     svc,
 		Checkers:    []httpadapter.PingChecker{pgChecker{pool: pool}, rmqChecker{conn: rmqConn}},
 		RateLimiter: limiter,
+		Metrics:     m,
 		// Admin routes: expose DLQ inspect and replay.
 		AMQPChannelProvider: rmqConn,
 		AdminPublisher:      publisher,
@@ -97,6 +100,9 @@ func run() error {
 		Addr:              ":" + cfg.HTTPPort,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)
@@ -128,7 +134,7 @@ func run() error {
 
 type pgChecker struct{ pool *pgxpool.Pool }
 
-func (c pgChecker) Name() string                  { return "postgres" }
+func (c pgChecker) Name() string                   { return "postgres" }
 func (c pgChecker) Ping(ctx context.Context) error { return c.pool.Ping(ctx) }
 
 type rmqChecker struct{ conn *rabbitmq.Connection }

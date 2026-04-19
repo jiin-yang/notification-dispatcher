@@ -17,6 +17,7 @@ import (
 
 	"github.com/jiin-yang/notification-dispatcher/internal/app"
 	"github.com/jiin-yang/notification-dispatcher/internal/domain"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/metrics"
 )
 
 const (
@@ -43,10 +44,11 @@ type NotificationHandler struct {
 	svc         NotificationService
 	logger      *slog.Logger
 	rateLimiter ChannelRateLimiter // may be nil (no limiting)
+	metrics     *metrics.Metrics   // may be nil (no metric emission)
 }
 
-func NewNotificationHandler(svc NotificationService, logger *slog.Logger, rl ChannelRateLimiter) *NotificationHandler {
-	return &NotificationHandler{svc: svc, logger: logger, rateLimiter: rl}
+func NewNotificationHandler(svc NotificationService, logger *slog.Logger, rl ChannelRateLimiter, m *metrics.Metrics) *NotificationHandler {
+	return &NotificationHandler{svc: svc, logger: logger, rateLimiter: rl, metrics: m}
 }
 
 func (h *NotificationHandler) Register(r chi.Router) {
@@ -70,6 +72,9 @@ func (h *NotificationHandler) create(w http.ResponseWriter, r *http.Request) {
 
 	if h.rateLimiter != nil {
 		if ok, retryAfter := h.rateLimiter.AllowChannel(req.Channel, 1); !ok {
+			if h.metrics != nil {
+				h.metrics.RateLimitRejected.WithLabelValues(string(req.Channel)).Inc()
+			}
 			secs := int(math.Ceil(retryAfter.Seconds()))
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded; try again later")
@@ -120,6 +125,10 @@ func (h *NotificationHandler) create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to create notification")
 			return
 		}
+	}
+
+	if h.metrics != nil {
+		h.metrics.NotificationsEnqueued.WithLabelValues(string(n.Channel), string(n.Priority)).Inc()
 	}
 
 	writeJSON(w, http.StatusAccepted, createNotificationResponse{
@@ -212,6 +221,11 @@ func (h *NotificationHandler) createBatch(w http.ResponseWriter, r *http.Request
 			}
 		}
 		if rateLimited {
+			if h.metrics != nil {
+				for ch := range channelCounts {
+					h.metrics.RateLimitRejected.WithLabelValues(string(ch)).Inc()
+				}
+			}
 			secs := int(math.Ceil(maxRetry.Seconds()))
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded; try again later")
@@ -244,6 +258,12 @@ func (h *NotificationHandler) createBatch(w http.ResponseWriter, r *http.Request
 		log.Error("create batch failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "failed to create batch")
 		return
+	}
+
+	if h.metrics != nil {
+		for _, n := range created {
+			h.metrics.NotificationsEnqueued.WithLabelValues(string(n.Channel), string(n.Priority)).Inc()
+		}
 	}
 
 	writeJSON(w, http.StatusAccepted, batchCreateResponse{

@@ -9,6 +9,7 @@ import (
 
 type Config struct {
 	HTTPPort        string        `env:"HTTP_PORT"                envDefault:"8080"`
+	MetricsPort     string        `env:"METRICS_PORT"             envDefault:"9090"`
 	DBDSN           string        `env:"DB_DSN,required"`
 	RMQURL          string        `env:"RMQ_URL,required"`
 	WebhookURL      string        `env:"WEBHOOK_URL,required"`

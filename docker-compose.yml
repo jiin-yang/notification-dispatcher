@@ -1,6 +1,13 @@
-# Phase 1 local-dev infra only.
-# The Go api and worker processes run on the host via `go run` (see Makefile).
-# No app containers are defined here.
+# Local environment. Two modes:
+#
+#   make dev-up                         # infra only (postgres + rabbitmq).
+#                                       # Run api/worker on the host via go run.
+#
+#   docker compose --profile app up -d --build
+#                                       # Full stack: infra + migrate + webhook
+#                                       # echo + api + worker containers.
+#
+# Services in the "app" profile only start when that profile is selected.
 
 services:
   rabbitmq:
@@ -38,6 +45,89 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  webhook:
+    # Lightweight request echo — prints every request to stdout. Lets the api
+    # and worker have a live webhook target out of the box.
+    profiles: ["app"]
+    image: mendhak/http-https-echo:33
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: 8081
+      LOG_WITHOUT_NEWLINE: "true"
+    ports:
+      - "8081:8081"
+
+  migrate:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile.migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      GOOSE_DBSTRING: postgres://notifier:notifier@postgres:5432/notifications?sslmode=disable
+    volumes:
+      - ./migrations:/migrations:ro
+    command: ["-dir", "/migrations", "up"]
+    restart: "no"
+
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+      args:
+        SERVICE: api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      HTTP_PORT: "8080"
+      DB_DSN: postgres://notifier:notifier@postgres:5432/notifications?sslmode=disable
+      RMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WEBHOOK_URL: http://webhook:8081/
+      LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    profiles: ["app"]
+    build:
+      context: .
+      args:
+        SERVICE: worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      METRICS_PORT: "9090"
+      DB_DSN: postgres://notifier:notifier@postgres:5432/notifications?sslmode=disable
+      RMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WEBHOOK_URL: http://webhook:8081/
+      LOG_LEVEL: info
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   rabbitmq_data:

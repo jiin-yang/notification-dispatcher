@@ -121,3 +121,12 @@ func (r *CircuitBreakerRegistry) BreakerState(ch domain.Channel) gobreaker.State
 	}
 	return gobreaker.StateClosed
 }
+
+// Channels returns the set of channels this registry has breakers for.
+func (r *CircuitBreakerRegistry) Channels() []domain.Channel {
+	out := make([]domain.Channel, 0, len(r.breakers))
+	for ch := range r.breakers {
+		out = append(out, ch)
+	}
+	return out
+}

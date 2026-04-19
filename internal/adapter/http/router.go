@@ -10,6 +10,7 @@ import (
 
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/rabbitmq"
 	"github.com/jiin-yang/notification-dispatcher/internal/domain"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/metrics"
 )
 
 // PingChecker is an alias for HealthChecker so callers that import only the
@@ -33,6 +34,9 @@ type RouterDeps struct {
 	// RateLimiter applies per-channel ingress limits. If nil, no limiting is
 	// applied (useful in tests that don't need rate-limit behavior).
 	RateLimiter ChannelRateLimiter
+	// Metrics, if non-nil, wires the HTTP metrics middleware, the /metrics
+	// endpoint, and gives the notification handler a sink for enqueue counters.
+	Metrics *metrics.Metrics
 	// Admin fields — both must be non-nil to mount the /admin routes.
 	// AMQPChannelProvider opens fresh AMQP channels for DLQ inspect/replay.
 	AMQPChannelProvider AMQPChannelProvider
@@ -56,11 +60,17 @@ func NewRouter(deps RouterDeps) chi.Router {
 	}
 
 	r := chi.NewRouter()
+	r.Use(Recoverer(log))
 	r.Use(CorrelationID)
 	r.Use(RequestLogger(log))
+	if deps.Metrics != nil {
+		r.Use(Metrics(deps.Metrics))
+	}
 
 	NewHealthHandler(deps.Checkers...).Register(r)
-	NewNotificationHandler(deps.Service, log, deps.RateLimiter).Register(r)
+	RegisterMetrics(r, deps.Metrics)
+	RegisterDocs(r)
+	NewNotificationHandler(deps.Service, log, deps.RateLimiter, deps.Metrics).Register(r)
 
 	if deps.AMQPChannelProvider != nil && deps.AdminPublisher != nil {
 		mainExchange := deps.AdminMainExchange

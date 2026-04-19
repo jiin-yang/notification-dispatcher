@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sony/gobreaker/v2"
+
+	httpadapter "github.com/jiin-yang/notification-dispatcher/internal/adapter/http"
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/postgres"
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/provider"
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/rabbitmq"
@@ -16,6 +23,7 @@ import (
 	"github.com/jiin-yang/notification-dispatcher/internal/domain"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform/logger"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/metrics"
 )
 
 func main() {
@@ -97,10 +105,13 @@ func run() error {
 	}
 	retryAdapter := rabbitmq.NewRetryPublisherAdapter(retryPub, topo)
 
+	m := metrics.New("worker")
+
 	deliver := app.NewDeliverUseCase(cbReg, notifRepo, log).
 		WithProcessedMarker(processedRepo).
 		WithRetryPublisher(retryAdapter).
-		WithAttemptRecorder(attemptsRepo)
+		WithAttemptRecorder(attemptsRepo).
+		WithMetrics(m)
 
 	hostname, _ := os.Hostname()
 
@@ -126,10 +137,79 @@ func run() error {
 		log.Info("consumer registered", "queue", b.Queue)
 	}
 
+	// Serve /metrics and /health/live from the worker process so scrapers and
+	// k8s probes can target it without reusing the api port.
+	metricsServer := newWorkerMetricsServer(cfg.MetricsPort, m)
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Info("worker metrics listening", "port", cfg.MetricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		_ = metricsServer.Shutdown(shutdownCtx)
+	}()
+
+	// Periodically publish circuit-breaker state as a Prometheus gauge so the
+	// worker's /metrics endpoint reflects open breakers without instrumenting
+	// the hot path on every delivery.
+	go reportBreakerStates(rootCtx, cbReg, m, 5*time.Second)
+
 	log.Info("starting workers", "queue_count", len(consumers))
 	return app.RunWorker(rootCtx, app.WorkerDeps{
 		Consumers:      consumers,
 		DeliverUseCase: deliver,
 		Logger:         log,
 	})
+}
+
+func newWorkerMetricsServer(port string, m *metrics.Metrics) *http.Server {
+	r := chi.NewRouter()
+	r.Get("/health/live", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	// Reuse the same docs+metrics helpers as the api for consistency.
+	httpadapter.RegisterDocs(r)
+	r.Method(http.MethodGet, "/metrics", promhttp.HandlerFor(m.Registry(), promhttp.HandlerOpts{
+		ErrorHandling: promhttp.ContinueOnError,
+	}))
+
+	return &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+func reportBreakerStates(ctx context.Context, cbReg *provider.CircuitBreakerRegistry, m *metrics.Metrics, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for _, ch := range cbReg.Channels() {
+				v := breakerStateValue(cbReg.BreakerState(ch))
+				m.CircuitBreakerState.WithLabelValues(string(ch)).Set(v)
+			}
+		}
+	}
+}
+
+func breakerStateValue(s gobreaker.State) float64 {
+	switch s {
+	case gobreaker.StateClosed:
+		return 0
+	case gobreaker.StateHalfOpen:
+		return 1
+	case gobreaker.StateOpen:
+		return 2
+	}
+	return 0
 }

@@ -24,6 +24,9 @@ help:
 	@echo "  dev-clean           Stop containers AND delete volumes  *** destroys all local data ***"
 	@echo "  dev-logs            Tail all container logs"
 	@echo "  dev-ps              Show container status"
+	@echo "  app-up              Build images and start the full app stack (infra + api + worker + webhook)"
+	@echo "  app-down            Stop the full app stack"
+	@echo "  app-logs            Tail logs for api and worker"
 	@echo ""
 	@echo "Migrations (requires goose: go install github.com/pressly/goose/v3/cmd/goose@latest):"
 	@echo "  migrate-up          Apply all pending migrations"
@@ -67,6 +70,18 @@ dev-logs:
 .PHONY: dev-ps
 dev-ps:
 	docker compose ps
+
+.PHONY: app-up
+app-up:
+	docker compose --profile app up -d --build --wait
+
+.PHONY: app-down
+app-down:
+	docker compose --profile app down
+
+.PHONY: app-logs
+app-logs:
+	docker compose --profile app logs -f api worker
 
 .PHONY: migrate-up
 migrate-up:
