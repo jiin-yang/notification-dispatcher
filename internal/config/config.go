@@ -15,6 +15,9 @@ type Config struct {
 	WebhookTimeout  time.Duration `env:"WEBHOOK_TIMEOUT"          envDefault:"10s"`
 	LogLevel        string        `env:"LOG_LEVEL"                envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT"         envDefault:"30s"`
+	// Per-channel in-process rate limiting (Phase 3).
+	RateLimitPerSecond float64 `env:"RATE_LIMIT_PER_SECOND"    envDefault:"100"`
+	RateLimitBurst     int     `env:"RATE_LIMIT_BURST"         envDefault:"200"`
 }
 
 func Load() (Config, error) {

@@ -19,6 +19,7 @@ import (
 	"github.com/jiin-yang/notification-dispatcher/internal/config"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform/logger"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/ratelimit"
 )
 
 func main() {
@@ -55,11 +56,13 @@ func run() error {
 	defer func() { _ = rmqConn.Close() }()
 	log.Info("rabbitmq connected")
 
+	topo := rabbitmq.ProductionTopology()
+
 	topoCh, err := rmqConn.Channel()
 	if err != nil {
 		return fmt.Errorf("open topology channel: %w", err)
 	}
-	if err := rabbitmq.DeclareTopology(topoCh); err != nil {
+	if err := rabbitmq.DeclareTopologyWith(topoCh, topo); err != nil {
 		return fmt.Errorf("declare topology: %w", err)
 	}
 	_ = topoCh.Close()
@@ -78,10 +81,13 @@ func run() error {
 	repo := pgadapter.NewNotificationRepository(pool)
 	svc := app.NewNotificationService(repo, publisher)
 
+	limiter := ratelimit.New(cfg.RateLimitPerSecond, cfg.RateLimitBurst)
+
 	router := httpadapter.NewRouter(httpadapter.RouterDeps{
-		Logger:   log,
-		Service:  svc,
-		Checkers: []httpadapter.PingChecker{pgChecker{pool: pool}, rmqChecker{conn: rmqConn}},
+		Logger:      log,
+		Service:     svc,
+		Checkers:    []httpadapter.PingChecker{pgChecker{pool: pool}, rmqChecker{conn: rmqConn}},
+		RateLimiter: limiter,
 	})
 
 	server := &http.Server{
@@ -119,7 +125,7 @@ func run() error {
 
 type pgChecker struct{ pool *pgxpool.Pool }
 
-func (c pgChecker) Name() string               { return "postgres" }
+func (c pgChecker) Name() string                  { return "postgres" }
 func (c pgChecker) Ping(ctx context.Context) error { return c.pool.Ping(ctx) }
 
 type rmqChecker struct{ conn *rabbitmq.Connection }

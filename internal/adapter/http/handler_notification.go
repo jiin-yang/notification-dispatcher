@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -39,12 +40,13 @@ type NotificationService interface {
 }
 
 type NotificationHandler struct {
-	svc    NotificationService
-	logger *slog.Logger
+	svc         NotificationService
+	logger      *slog.Logger
+	rateLimiter ChannelRateLimiter // may be nil (no limiting)
 }
 
-func NewNotificationHandler(svc NotificationService, logger *slog.Logger) *NotificationHandler {
-	return &NotificationHandler{svc: svc, logger: logger}
+func NewNotificationHandler(svc NotificationService, logger *slog.Logger, rl ChannelRateLimiter) *NotificationHandler {
+	return &NotificationHandler{svc: svc, logger: logger, rateLimiter: rl}
 }
 
 func (h *NotificationHandler) Register(r chi.Router) {
@@ -64,6 +66,15 @@ func (h *NotificationHandler) create(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body")
 		return
+	}
+
+	if h.rateLimiter != nil {
+		if ok, retryAfter := h.rateLimiter.AllowChannel(req.Channel, 1); !ok {
+			secs := int(math.Ceil(retryAfter.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded; try again later")
+			return
+		}
 	}
 
 	cid, err := uuid.Parse(correlationIDFrom(r.Context()))
@@ -181,6 +192,31 @@ func (h *NotificationHandler) createBatch(w http.ResponseWriter, r *http.Request
 	if len(validationErrs) > 0 {
 		writeJSON(w, http.StatusBadRequest, validationErrorResponse{Errors: validationErrs})
 		return
+	}
+
+	if h.rateLimiter != nil {
+		// Count per-channel, then check each bucket. The whole batch is
+		// rejected (all-or-nothing) if any channel's bucket is exhausted.
+		channelCounts := make(map[domain.Channel]int, 3)
+		for _, item := range req.Notifications {
+			channelCounts[item.Channel]++
+		}
+		var maxRetry time.Duration
+		var rateLimited bool
+		for ch, n := range channelCounts {
+			if ok, retryAfter := h.rateLimiter.AllowChannel(ch, n); !ok {
+				rateLimited = true
+				if retryAfter > maxRetry {
+					maxRetry = retryAfter
+				}
+			}
+		}
+		if rateLimited {
+			secs := int(math.Ceil(maxRetry.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded; try again later")
+			return
+		}
 	}
 
 	cid, err := uuid.Parse(correlationIDFrom(r.Context()))

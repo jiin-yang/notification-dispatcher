@@ -8,7 +8,7 @@
 //
 // Run:
 //
-//	go test -tags=e2e -v -timeout 60s ./test/e2e/...
+//	go test -tags=e2e -v -timeout 120s ./test/e2e/...
 //
 // The suite creates and migrates a dedicated `notifications_test` database and
 // uses a `test_notifications.*` RabbitMQ topology so it never conflicts with
@@ -38,26 +38,41 @@ import (
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/provider"
 	"github.com/jiin-yang/notification-dispatcher/internal/adapter/rabbitmq"
 	"github.com/jiin-yang/notification-dispatcher/internal/app"
+	"github.com/jiin-yang/notification-dispatcher/internal/domain"
 	"github.com/jiin-yang/notification-dispatcher/internal/platform"
+	"github.com/jiin-yang/notification-dispatcher/internal/platform/ratelimit"
 )
 
 const (
-	// testDBName is the isolated Postgres database used by the e2e suite.
 	testDBName = "notifications_test"
 
-	// Production DB connection params reused to connect to the postgres
-	// maintenance database for CREATE DATABASE.
 	adminDSN = "postgres://notifier:notifier@localhost:5432/postgres?sslmode=disable"
 	testDSN  = "postgres://notifier:notifier@localhost:5432/" + testDBName + "?sslmode=disable"
 
 	rmqURL = "amqp://guest:guest@localhost:5672/"
 
-	// Test-scoped RabbitMQ topology names — isolated from the dev topology.
-	testExchange   = "test_notifications.topic"
-	testQueue      = "test_notifications.default"
-	testBindingKey = "#"
-
+	// Test-scoped RabbitMQ exchange name — isolated from the dev exchange.
+	testExchange = "test_notifications.topic"
 )
+
+// testBindings returns a set of test-prefixed bindings mirroring production.
+// Tests use a "test_" prefix so they never conflict with a running dev worker.
+func testBindings() []rabbitmq.QueueBinding {
+	bindings := rabbitmq.AllProductionBindings()
+	for i := range bindings {
+		bindings[i].Queue = "test_" + bindings[i].Queue
+		// RoutingKey stays the same so the publisher's routing key still matches.
+	}
+	return bindings
+}
+
+// testTopology returns the full 9-queue test topology.
+func testTopology() rabbitmq.Topology {
+	return rabbitmq.Topology{
+		Exchange: testExchange,
+		Bindings: testBindings(),
+	}
+}
 
 // harness holds the shared infrastructure for the test suite.
 type harness struct {
@@ -72,7 +87,6 @@ func newHarness(t *testing.T) *harness {
 	t.Helper()
 	ctx := context.Background()
 
-	// Ensure test DB exists.
 	ensureTestDB(t)
 
 	pool, err := platform.NewPgxPool(ctx, testDSN)
@@ -88,11 +102,7 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("connect rabbitmq: %v", err)
 	}
 
-	topo := rabbitmq.Topology{
-		Exchange:   testExchange,
-		Queue:      testQueue,
-		BindingKey: testBindingKey,
-	}
+	topo := testTopology()
 
 	topoCh, err := rmqConn.Channel()
 	if err != nil {
@@ -116,51 +126,65 @@ func (h *harness) close() {
 	h.pool.Close()
 }
 
-// reset truncates the notifications table and purges the test queue so each
-// subtest starts with no leftover rows or stale messages from previous runs.
-// Phase 1 subtests call this; Phase 2 subtests call resetFull which also
-// clears the batches table.
+// reset truncates the notifications and processed_messages tables and purges
+// all test queues so each subtest starts clean.
 func (h *harness) reset(t *testing.T) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
 	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE notifications"); err != nil {
 		t.Fatalf("truncate notifications: %v", err)
 	}
-	ch, err := h.rmqConn.Channel()
-	if err != nil {
-		t.Fatalf("open channel for purge: %v", err)
+	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE processed_messages"); err != nil {
+		t.Fatalf("truncate processed_messages: %v", err)
 	}
-	defer ch.Close()
-	if _, err := ch.QueuePurge(h.topo.Queue, false); err != nil {
-		t.Fatalf("purge test queue: %v", err)
-	}
+
+	h.purgeAllQueues(t)
 }
 
-// resetFull truncates both notifications and batches (which notifications
-// references via FK) and purges the queue.
+// resetFull truncates batches (cascades to notifications) and processed_messages,
+// and purges all test queues.
 func (h *harness) resetFull(t *testing.T) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// TRUNCATE ... CASCADE handles the FK from notifications.batch_id → batches.id.
+
 	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE batches CASCADE"); err != nil {
 		t.Fatalf("truncate batches: %v", err)
 	}
+	if _, err := h.pool.Exec(ctx, "TRUNCATE TABLE processed_messages"); err != nil {
+		t.Fatalf("truncate processed_messages: %v", err)
+	}
+
+	h.purgeAllQueues(t)
+}
+
+func (h *harness) purgeAllQueues(t *testing.T) {
+	t.Helper()
 	ch, err := h.rmqConn.Channel()
 	if err != nil {
 		t.Fatalf("open channel for purge: %v", err)
 	}
 	defer ch.Close()
-	if _, err := ch.QueuePurge(h.topo.Queue, false); err != nil {
-		t.Fatalf("purge test queue: %v", err)
+
+	for _, b := range h.topo.Bindings {
+		if _, err := ch.QueuePurge(b.Queue, false); err != nil {
+			t.Logf("purge %s: %v (ok if queue doesn't exist yet)", b.Queue, err)
+		}
 	}
 }
 
 // startAPI wires the API in-process and returns a running httptest.Server.
-// The caller owns Close().
-func (h *harness) startAPI(t *testing.T, webhookURL string) *httptest.Server {
+// opts may be provided to override default wiring (e.g. inject a custom rate
+// limiter for rate-limit tests). The caller owns Close().
+func (h *harness) startAPI(t *testing.T, webhookURL string, opts ...apiOption) *httptest.Server {
 	t.Helper()
+
+	cfg := apiConfig{} // defaults: no rate limiter
+	for _, o := range opts {
+		o(&cfg)
+	}
 
 	pubCh, err := h.rmqConn.Channel()
 	if err != nil {
@@ -178,88 +202,135 @@ func (h *harness) startAPI(t *testing.T, webhookURL string) *httptest.Server {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	router := httpadapter.NewRouter(httpadapter.RouterDeps{
-		Logger:  log,
-		Service: svc,
+		Logger:      log,
+		Service:     svc,
+		RateLimiter: cfg.rateLimiter,
 	})
 
 	srv := httptest.NewServer(router)
-	_ = webhookURL // stored in workerDeps; declared here for documentation clarity
+	_ = webhookURL
 	return srv
 }
 
-// startWorker registers a consumer on the test queue synchronously (so the
-// caller knows messages won't be dropped), then starts the delivery loop in a
-// background goroutine. Returns a cancel func; calling it stops the worker.
+type apiConfig struct {
+	rateLimiter httpadapter.ChannelRateLimiter
+}
+
+type apiOption func(*apiConfig)
+
+// withRateLimit injects a custom ChannelLimiter into the API.
+func withRateLimit(rps float64, burst int) apiOption {
+	return func(cfg *apiConfig) {
+		cfg.rateLimiter = ratelimit.New(rps, burst)
+	}
+}
+
+// startWorker registers consumers on all test queues and starts the delivery
+// loop in a background goroutine. Returns a cancel func; calling it stops the
+// worker and waits for it to drain.
 func (h *harness) startWorker(t *testing.T, webhookURL string) context.CancelFunc {
 	t.Helper()
+	return h.startWorkerWithDeliver(t, webhookURL, nil)
+}
 
-	consumeCh, err := h.rmqConn.Channel()
-	if err != nil {
-		t.Fatalf("open consumer channel: %v", err)
+// startWorkerWithDeliver is like startWorker but accepts a pre-built
+// DeliverUseCase. Pass nil to build one from webhookURL (normal case).
+func (h *harness) startWorkerWithDeliver(t *testing.T, webhookURL string, deliver *app.DeliverUseCase) context.CancelFunc {
+	t.Helper()
+
+	if deliver == nil {
+		webhook := provider.NewWebhookProvider(provider.WebhookOptions{
+			URL:     webhookURL,
+			Timeout: 5 * time.Second,
+		})
+		reg := provider.NewRegistry()
+		reg.MustRegister(domain.ChannelEmail, webhook)
+		reg.MustRegister(domain.ChannelSMS, webhook)
+		reg.MustRegister(domain.ChannelPush, webhook)
+
+		repo := pgadapter.NewNotificationRepository(h.pool)
+		processedRepo := pgadapter.NewProcessedRepository(h.pool)
+		log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		deliver = app.NewDeliverUseCase(reg, repo, log).
+			WithProcessedMarker(processedRepo)
 	}
 
-	if err := consumeCh.Qos(5, 0, false); err != nil {
-		_ = consumeCh.Close()
-		t.Fatalf("set qos: %v", err)
-	}
-
-	consumerTag := fmt.Sprintf("e2e-worker-%d", time.Now().UnixNano())
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Register the subscription synchronously so no messages are lost between
-	// startWorker returning and the goroutine scheduling.
-	deliveries, err := consumeCh.ConsumeWithContext(
-		ctx,
-		h.topo.Queue,
-		consumerTag,
-		false, // autoAck
-		false, // exclusive
-		false, // noLocal
-		false, // noWait
-		nil,
-	)
-	if err != nil {
-		cancel()
-		_ = consumeCh.Close()
-		t.Fatalf("start consume on %s: %v", h.topo.Queue, err)
+	// We build one deliveries channel per queue binding and fan them into a
+	// single process loop. This mirrors production's one-goroutine-per-queue
+	// model without the overhead of per-channel AMQP channels.
+	type queueDeliveries struct {
+		queue      string
+		deliveries <-chan amqp.Delivery
+		consumeCh  *amqp.Channel
 	}
 
-	webhook := provider.NewWebhookProvider(provider.WebhookOptions{
-		URL:     webhookURL,
-		Timeout: 5 * time.Second,
-	})
-	repo := pgadapter.NewNotificationRepository(h.pool)
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	deliver := app.NewDeliverUseCase(webhook, repo, log)
+	qds := make([]queueDeliveries, 0, len(h.topo.Bindings))
+	for _, b := range h.topo.Bindings {
+		consumeCh, err := h.rmqConn.Channel()
+		if err != nil {
+			cancel()
+			t.Fatalf("open consumer channel for %s: %v", b.Queue, err)
+		}
+
+		if err := consumeCh.Qos(5, 0, false); err != nil {
+			_ = consumeCh.Close()
+			cancel()
+			t.Fatalf("set qos on %s: %v", b.Queue, err)
+		}
+
+		tag := fmt.Sprintf("e2e-worker-%s-%d", b.Queue, time.Now().UnixNano())
+		deliveries, err := consumeCh.ConsumeWithContext(
+			ctx,
+			b.Queue,
+			tag,
+			false, // autoAck
+			false, // exclusive
+			false, // noLocal
+			false, // noWait
+			nil,
+		)
+		if err != nil {
+			_ = consumeCh.Close()
+			cancel()
+			t.Fatalf("start consume on %s: %v", b.Queue, err)
+		}
+
+		qds = append(qds, queueDeliveries{queue: b.Queue, deliveries: deliveries, consumeCh: consumeCh})
+	}
 
 	var wg sync.WaitGroup
-	wg.Add(1)
 
 	t.Cleanup(func() {
 		cancel()
-		wg.Wait()       // wait for the goroutine to drain and exit
-		_ = consumeCh.Close()
+		wg.Wait()
+		for _, qd := range qds {
+			_ = qd.consumeCh.Close()
+		}
 	})
 
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				// When the context is cancelled, amqp091-go will close the
-				// deliveries channel. Drain remaining in-flight messages.
-				for d := range deliveries {
-					processDelivery(context.Background(), d, deliver)
-				}
-				return
-			case d, ok := <-deliveries:
-				if !ok {
+	for _, qd := range qds {
+		qd := qd
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					for d := range qd.deliveries {
+						processDelivery(context.Background(), d, deliver)
+					}
 					return
+				case d, ok := <-qd.deliveries:
+					if !ok {
+						return
+					}
+					processDelivery(ctx, d, deliver)
 				}
-				processDelivery(ctx, d, deliver)
 			}
-		}
-	}()
+		}()
+	}
 
 	return cancel
 }
@@ -301,8 +372,32 @@ func (h *harness) pollStatus(t *testing.T, id string, deadline time.Duration) st
 	}
 }
 
-// ensureTestDB creates notifications_test if it does not exist. Connects via
-// the admin/maintenance "postgres" database.
+// publishDirect publishes a raw JSON body directly to the test exchange with
+// the given routing key and headers, bypassing the API. Used by idempotency
+// tests that need to inject duplicate messages.
+func (h *harness) publishDirect(t *testing.T, routingKey string, headers map[string]any, body []byte) {
+	t.Helper()
+
+	pubCh, err := h.rmqConn.Channel()
+	if err != nil {
+		t.Fatalf("publishDirect: open channel: %v", err)
+	}
+	defer pubCh.Close()
+
+	pub, err := rabbitmq.NewPublisher(pubCh, h.topo.Exchange)
+	if err != nil {
+		t.Fatalf("publishDirect: new publisher: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := pub.Publish(ctx, routingKey, headers, body); err != nil {
+		t.Fatalf("publishDirect: publish: %v", err)
+	}
+}
+
+// ensureTestDB creates notifications_test if it does not exist.
 func ensureTestDB(t *testing.T) {
 	t.Helper()
 	db, err := sql.Open("pgx", adminDSN)
@@ -311,7 +406,6 @@ func ensureTestDB(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Check if DB exists.
 	var exists bool
 	err = db.QueryRow(
 		"SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", testDBName,
@@ -329,11 +423,8 @@ func ensureTestDB(t *testing.T) {
 
 // projectRoot returns the absolute path of the module root by walking two
 // directories up from this source file (test/e2e/ → test/ → root/).
-// Using runtime.Caller is the only approach that works regardless of the
-// working directory go test is invoked from.
 func projectRoot() string {
 	_, thisFile, _, _ := runtime.Caller(0)
-	// thisFile = .../notification-dispatcher/test/e2e/helpers_test.go
 	return filepath.Join(filepath.Dir(thisFile), "..", "..")
 }
 
