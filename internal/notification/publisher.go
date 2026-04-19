@@ -1,0 +1,3 @@
+package notification
+
+// Publisher interface
