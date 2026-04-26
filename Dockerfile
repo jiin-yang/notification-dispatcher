@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- builder ----------------------------------------------------------------
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 ARG SERVICE
 RUN test -n "$SERVICE" || (echo "SERVICE build-arg is required (api|worker)" && false)
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
 
 # ---- runtime ----------------------------------------------------------------
-FROM alpine:3.20
+FROM alpine:3.23
 
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S app && adduser -S -G app app
